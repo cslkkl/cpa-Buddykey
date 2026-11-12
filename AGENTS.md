@@ -119,6 +119,14 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
   做桩时踩的坑：`disabled` 只能存在 `FILES` 里、`/accounts` 响应现算（真 CPA 就是这样），
   各存一份会出现「auth-files 已停用、accounts 还说启用中」的假象，把正常行为误判成 bug。
 
+- **解封后在真机走完整链路（已通过）**：
+  8 个号全 `disabled:false`、remain 30429；建带 `selected` + `requestsPerDay:2` 的 key，
+  连发 3 次 `200 / 200 / 429` 且全部落在指定 2 个号内、账本只增 2 行、还原后 `enabled=8`；
+  `npm run setup` 自动嗅探到 `sk-cpa-local-2026`、校验读到 16 个凭据文件；
+  用 setup 产物起服务后 `/healthz` 报 `from: "config"`，建 key + 调模型 **200**。
+
+  也就是说：**「别人拉下来能不能用」这条目标已达成**，前提是那人已有可用的 CPA 与已登录账号。
+
 ## 待办
 
 见 [docs/PLAN.md](docs/PLAN.md)。A / B / C / D / E 五节全部完成，

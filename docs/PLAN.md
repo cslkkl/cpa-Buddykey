@@ -205,6 +205,28 @@ dsh-cpa-switch 生成的，别人 clone 下来必然读不到，于是账号列�
 > 用假管理密钥测试会把这台机器封 30 分钟，且每次重试都重新计时。
 > 要测「密钥错误」的分支，用 `npm run fake-cpa` 打桩，别对真 CPA 试。
 
+### E4. 解封后在真机走完整链路 —— 已完成（2026-11-12 20:34）
+
+CPA 的 IP 封禁到期后，在**真实 CPA + 真实账号池**上把整条链路走了一遍：
+
+| 场景 | 结果 |
+| --- | --- |
+| 生产服务读账号 | `ok:true`，8 个号全 `disabled:false`，remain 30429 |
+| `state.pool` | 恢复 `ok:true, accountCount:8` |
+| 真机登录流程 | `POST /admin/api/login` 返回腾讯授权地址（`https://copilot.tencent.com/login?platform=CLI&state=…`），`status=wait` 后取消会话，没真授权 |
+| 建 key（范围 + 限额） | `selected` 勾 2 个号、`requestsPerDay:2` |
+| 连发 3 次 | `200`（落 `0f4f3a929bd81dc3`）/ `200`（落 `45ae2dfed4479b92`）/ `429` —— 全部落在指定范围内 |
+| 429 不写账 | 账本增量 **2**（不是 3） |
+| 范围还原 | 请求后 `enabled` 回到 8 |
+| 清理 | 删掉这把验收 key，回到原有 2 把 |
+| **`npm run setup` 真机全流程** | 自动嗅探到 `sk-cpa-local-2026`、粘管理密钥后 `✓ 读到 16 个凭据文件`、exit 0 |
+| 用 setup 产物起服务 | `/healthz` 报 `upstreamKeyFrom: "config"` / `adminKeyFrom: "config"` |
+| 用 setup 产物建 key + 调用 | 建 key `ok:true`，调 `deepseek-v4.1` **200**，落号 `47c82c4c8415a897` |
+
+**结论：这条目标达成了。** 一个「已装好 CPA、已登录 WorkBuddy 账号、知道两个密钥」
+的人，clone → `npm run setup`（两分钟内）→ `npm start` → 打开页面 →
+登录/建 key → 发出第一个请求，全程不需要改代码、不需要作者这台机器的任何东西。
+
 ## 三、另一个项目的搬迁（未完成，可延后）
 
 `dsh-cpa-switch` 仍在 `Desktop\dsh-cpa-switch`，目标位置是 `Desktop\Projects\dsh-cpa-switch`。
