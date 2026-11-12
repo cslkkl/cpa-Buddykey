@@ -9,8 +9,9 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check lib/ui.mjs && node --check tools/setup.mjs",
+    "check": "node --check server.mjs && node --check lib/ui.mjs && node --check tools/setup.mjs && node --check tools/fake-cpa.mjs",
     "check:docs": "pwsh -NoProfile -File tools/check-docs.ps1",
-    "setup": "node tools/setup.mjs"
+    "setup": "node tools/setup.mjs",
+    "fake-cpa": "node tools/fake-cpa.mjs"
   }
 }
