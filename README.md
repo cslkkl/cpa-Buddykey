@@ -177,6 +177,24 @@ CPA 没起，或者 `upstream` 地址不对。先 `curl http://127.0.0.1:8317/v1
 - 维护索引与常用命令 → [AGENTS.md](AGENTS.md)
 - 交接与后续计划 → [docs/PLAN.md](docs/PLAN.md)
 
+## 开发与自测
+
+不需要真 CPA 也能测上游相关的分支：
+
+```bash
+npm run fake-cpa            # 假 CPA，起在 127.0.0.1:8390
+# admin key: fake-admin-key   upstream key: fake-upstream-key
+```
+
+它实现了 BuddyKey 用到的全部接口（账号 / 余额 / 登录 / 开关 / 改模型），
+还会模拟「连续输错管理密钥 → IP 封禁」的行为（阈值调成 3 次，方便复现）。
+把 `upstream` 指到它就切断了与真实账号池的关系。
+
+```bash
+npm run check               # 四个 .mjs 的语法自检
+npm run check:docs          # 文档相对链接 + 换行约定
+```
+
 ## License
 
 MIT

@@ -17,8 +17,17 @@
 ```bash
 npm start                     # 启动（等价 node server.mjs）
 npm run setup                 # 首次配置：一问一答写 data/config.json
-npm run check                 # 语法自检（server.mjs + lib/ui.mjs + tools/setup.mjs）
+npm run fake-cpa              # 起一个假 CPA（默认 8390），测密钥错误 / 封禁分支用
+npm run check                 # 语法自检（server.mjs + lib/ui.mjs + 两个 tools）
 npm run check:docs            # 文档相对链接 + 换行约定（tools/check-docs.ps1）
+```
+
+**测上游相关分支一律用 `npm run fake-cpa`，别拿真 CPA 试** —— 它有 IP 级失败封禁。
+
+```bash
+# 桩的管理密钥 / 上游 key 是固定值，直接配进一个隔离副本的 config.json 就能跑
+node tools/fake-cpa.mjs 8390
+# admin key: fake-admin-key    upstream key: fake-upstream-key
 ```
 
 `npm run setup` 也支持全参数非交互模式，方便远程指导别人粘一段命令：
@@ -44,10 +53,12 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 
 - 语法：`npm run check` 通过（`server.mjs` + `lib/ui.mjs`）；`npm run check:docs` 0 失效链接、换行合规。
 - 真机：登录 / 账号列表 / 单模型放行 / 公网隧道调用 均已验过（2026-11-12）。
-- **线上进程已换成新代码**（2026-11-12 18:57，pid 见 `data/server.log`）：
-  `127.0.0.1:8318` 覆盖启动一次，`/healthz` 200 `keys:2`，首页 43 KB、
-  两个占位符无残留、含 `--hairline:#e8e8ed`（新 UI 生效），
-  用真实 key 实调一次 `deepseek-v4.1-flash` 得 200 并落号 `b6cb402f71d99636`，
+- **线上进程已换成新代码**（2026-11-12 20:15 重启，旧 pid 30388 → 新 pid 17024）：
+  `/healthz` 多了 `upstreamKeyFrom: "refs"` / `adminKeyFrom: "refs"`（本机走旧路径，符合预期）；
+  `/admin/api/state` 有完整 `setup` 段；封禁期间 `pool` 回 `ok:false` + 「还剩约 18m29s」
+  而不是假装空池；用真实 key 调 `deepseek-v4.1` 仍 **200**，落号 `0f4f3a929bd81dc3`。
+- **早先一次线上验证**（2026-11-12 18:57）：
+  `/healthz` 200 `keys:2`，首页 43 KB、两个占位符无残留、含 `--hairline:#e8e8ed`（新 UI 生效），
   两把真实 key 的当日用量（12 次 / 2.21 积分、4 次 / 0 积分）经账本回放后一致。
 - **日额度 + 账号范围：已验收**（2026-11-12，隔离副本 8399 + 真实 CPA 8317）：
 
@@ -88,6 +99,25 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
   | `npm run setup` 交互 / 非交互 | 都能写 `data/config.json`；上游 key 从 CPA `access.api-keys` 自动嗅探成 `sk-cpa-local-2026` |
 
   未验（受 CPA 的 IP 封禁限制）：配好密钥后引导卡片是否收起；陌生人走完「登录 → 入池 → 建 key → 调用」整链。
+  → 这两条已在下一节用打桩上游补验完毕。
+
+- **用打桩上游补验了剩下的分支**（`npm run fake-cpa`，端口 8390 + 隔离副本）：
+
+  | 场景 | 结果 |
+  | --- | --- |
+  | 账号列表（密钥正确） | `ok:true`，2 个号，remain 2000 / used 500 |
+  | 引导卡片（密钥齐全） | **已收起**，池子 2,000、账号数 2 |
+  | 登录流程 | 授权 URL 正常出、`status=done` 能收尾 |
+  | 账号开关 | 停用后 `enabled=1` 且该行 `disabled=true`；恢复后 `enabled=2` |
+  | 范围 + 日额度联合 | `selected` 勾一个号连发 4 次：前 2 次 200 落号一致，第 3、4 次 429 |
+  | 429 响应 | `retry-after: 13616`、`code: daily_quota_exceeded` |
+  | 范围还原 | 请求后 `enabled` 回到 2 |
+  | 管理密钥错误 | 「管理密钥不对……要 management.secret-key 的明文，不是 bcrypt 哈希」 |
+  | 连续错密钥 → 封禁 | 升级成「CPA 把这个 IP 临时封了……还剩约 1m0s。别继续重试」 |
+  | `npm run setup` 密钥正确 / 错误 | `✓ 管理密钥有效，读到 2 个凭据文件` exit 0 / `⚠️ HTTP 401` exit 2 |
+
+  做桩时踩的坑：`disabled` 只能存在 `FILES` 里、`/accounts` 响应现算（真 CPA 就是这样），
+  各存一份会出现「auth-files 已停用、accounts 还说启用中」的假象，把正常行为误判成 bug。
 
 ## 待办
 

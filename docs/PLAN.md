@@ -163,9 +163,47 @@ dsh-cpa-switch 生成的，别人 clone 下来必然读不到，于是账号列�
 - 陌生人走完「登录 WorkBuddy 账号 → 账号进池 → 建 key → 调用」的完整链路。
   其中「建 key → 调用」已单独验过（见上表），只差登录那一段。
 
+### E2. 用打桩上游把剩下的分支补验 —— 已完成（2026-11-12）
+
+真 CPA 被封着，就用 `tools/fake-cpa.mjs`（`npm run fake-cpa`，默认 8390）
+起一个形状对齐的假上游，把「密钥配好之后」的行为全验了一遍。它同时是个长期资产：
+以后测「密钥错误」「上游报错」「IP 封禁」都不用碰真账号池。
+
+| 场景 | 结果 |
+| --- | --- |
+| 账号列表（密钥正确） | `ok:true`，2 个号，`summary` 合计 remain 2000 / used 500 |
+| `state.setup` 密钥齐全 | `upstreamKey=ok/config`、`adminKey=ok/config` |
+| 引导卡片 | **已收起**（`setupCard.hidden === true`），池子显示 2,000、账号数 2 |
+| 登录流程 | 起授权 URL 正常、`status=done` 能收尾 |
+| 账号开关 | 停用后 `enabled=1` 且该行 `disabled=true`；恢复后 `enabled=2` |
+| 范围 + 日额度联合 | `selected` 只勾一个号连发 4 次：前 2 次 200 且落号一致，第 3、4 次 429（`requestsPerDay:3` 已达上限） |
+| 429 响应 | `retry-after: 13616`、`code: daily_quota_exceeded` |
+| 范围还原 | 请求后 `enabled` 回到 2 |
+| 管理密钥错误 | 「管理密钥不对（CPA 回 invalid management key）。adminKey 要 management.secret-key 的明文，不是那个 bcrypt 哈希。」 |
+| 连续错密钥 → 封禁 | 升级成「CPA 把这个 IP 临时封了……还剩约 1m0s。等它到期即可，别继续重试」 |
+| `npm run setup` 密钥正确 | `✓ 管理密钥有效，CPA 里读到 2 个凭据文件。`，exit 0 |
+| `npm run setup` 密钥错误 | `⚠️ 上游回 HTTP 401 —— 管理密钥大概率不对`，exit 2 |
+
+**做桩时踩到的两个坑**（已写进代码注释）：
+
+1. `disabled` 只能存在 `FILES` 里、`/accounts` 的响应现算 —— 真 CPA 就是这样。
+   桩里各存一份会出现「auth-files 已停用、accounts 还说启用中」的假象，
+   把被测代码的正常行为误判成 bug（第一版桩就错了，白查一轮）。
+2. `readPool()` 与 `listAccounts()` 读的字段不同：前者只用 `/plugins/<channel>/accounts`
+   与 `/credits`，后者还多读 `/auth-files` 拿文件名。桩这三条都要对上。
+
+### E3. 生产服务已切新代码
+
+`127.0.0.1:8318` 已重启（旧 pid 30388 → 新 pid 17024），实测：
+
+- `/healthz` 多了 `upstreamKeyFrom: "refs"` / `adminKeyFrom: "refs"`（本机走的是旧路径，符合预期）；
+- `/admin/api/state` 有完整 `setup` 段；
+- 封禁期间 `pool` 正确回 `ok:false` + 「还剩约 18m29s」而不是假装空池；
+- 用真实 key 调 `deepseek-v4.1` 仍然 **200**，落号 `0f4f3a929bd81dc3` —— 数据面不受管理面封禁影响。
+
 > ⚠️ 复现这段测试时注意：CPA 对 `/v0/management/*` 有 IP 级失败计数，
 > 用假管理密钥测试会把这台机器封 30 分钟，且每次重试都重新计时。
-> 要测「密钥错误」的分支，改成对**打桩的上游**测，别对真 CPA 试。
+> 要测「密钥错误」的分支，用 `npm run fake-cpa` 打桩，别对真 CPA 试。
 
 ## 三、另一个项目的搬迁（未完成，可延后）
 
