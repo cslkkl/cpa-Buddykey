@@ -1,0 +1,14 @@
+# 仓库统一 LF：Windows 上 core.autocrlf 会把检出改成 CRLF，
+# 让 diff、校验脚本和 CI 都按 LF 对齐。
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则 cmd.exe 会把行尾当命令的一部分。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制，别做任何换行转换。
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.ico binary
