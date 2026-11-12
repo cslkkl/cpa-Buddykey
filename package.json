@@ -1,0 +1,14 @@
+{
+  "name": "buddykey",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把 WorkBuddy 多账号的积分池做成具名 API Key 的本地网关",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check lib/ui.mjs"
+  }
+}

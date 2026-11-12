@@ -1,0 +1,12 @@
+# 运行时数据（key 明文、调用账本、隧道日志）—— 不入库
+data/
+
+# cloudflared 二进制，52 MB，用时自己下
+bin/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log

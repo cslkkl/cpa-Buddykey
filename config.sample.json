@@ -1,0 +1,15 @@
+{
+  "host": "127.0.0.1",
+  "port": 8318,
+  "upstream": "http://127.0.0.1:8317",
+  "upstreamKeyRef": "CPA_API_KEY",
+  "adminKeyRef": "CPA_ADMIN_KEY",
+  "channel": "workbuddy",
+  "model": "wb/deepseek-v4.1-flash",
+  "acceptModels": [
+    "wb/deepseek-v4.1-flash",
+    "wb/deepseek-v4.1",
+    "deepseek-v4.1-flash",
+    "deepseek-v4.1"
+  ]
+}
