@@ -39,7 +39,13 @@ const DEFAULTS = {
   port: 8318,
   /** 上游：本机 CPA。 */
   upstream: 'http://127.0.0.1:8317',
-  /** 上游 key 从 `~/.dsh/.credentials.yaml` 的 refs 段按名字取，不落第二份。 */
+  /** 两个 CPA 密钥从哪来，见 `resolveSecret` 的三级回退。 */
+  upstreamKey: '',
+  adminKey: '',
+  upstreamKeyEnv: 'BUDDYKEY_UPSTREAM_KEY',
+  adminKeyEnv: 'BUDDYKEY_ADMIN_KEY',
+  /** 旧路径：`~/.dsh/.credentials.yaml` 的 refs 段。留空 = 不读那个文件。 */
+  credentialsFile: '',
   upstreamKeyRef: 'CPA_API_KEY',
   adminKeyRef: 'CPA_ADMIN_KEY',
   /** 这一层锁死的渠道与模型。 */
@@ -52,8 +58,18 @@ const DEFAULTS = {
 
 const CONFIG = { ...DEFAULTS, ...readJson(CONFIG_FILE, {}) }
 const CREDS = readCredentialRefs()
-const UPSTREAM_KEY = CREDS[CONFIG.upstreamKeyRef] ?? ''
-const ADMIN_KEY = CREDS[CONFIG.adminKeyRef] ?? ''
+const UPSTREAM = resolveSecret({
+  direct: CONFIG.upstreamKey,
+  envName: CONFIG.upstreamKeyEnv,
+  refName: CONFIG.upstreamKeyRef,
+})
+const ADMIN = resolveSecret({
+  direct: CONFIG.adminKey,
+  envName: CONFIG.adminKeyEnv,
+  refName: CONFIG.adminKeyRef,
+})
+const UPSTREAM_KEY = UPSTREAM.value
+const ADMIN_KEY = ADMIN.value
 
 /* ────────────────────────────── 基础工具 ────────────────────────────── */
 
@@ -81,11 +97,24 @@ function parseJsonText(text, fallback) {
   }
 }
 
-/** 从 `~/.dsh/.credentials.yaml` 的 `refs:` 段取凭据（只取用得到的几个）。 */
+/**
+ * 从 `~/.dsh/.credentials.yaml` 的 `refs:` 段取凭据（只取用得到的几个）。
+ *
+ * ⚠️ 这是**旧路径**，只为兼容「这台机器上装着 dsh-cpa-switch」的场景。
+ *   别人拉这个仓库时没有那个文件，函数会安静地返回 `{}`，
+ *   于是 `resolveSecret` 落到 `none` —— 管理页会直接告诉你缺什么，而不是装作配好了。
+ *
+ * `config.credentialsFile` 留空 = 用默认路径 `~/.dsh/.credentials.yaml`；
+ * 填了就只读那一个，方便把这层挪到别处。
+ */
 function readCredentialRefs() {
-  const file = path.join(os.homedir(), '.dsh', '.credentials.yaml')
+  const configured =
+    typeof CONFIG.credentialsFile === 'string' && CONFIG.credentialsFile.trim() !== ''
+      ? CONFIG.credentialsFile.trim()
+      : path.join(os.homedir(), '.dsh', '.credentials.yaml')
   try {
-    const text = fs.readFileSync(file, 'utf8')
+    if (!fs.existsSync(configured)) return {}
+    const text = fs.readFileSync(configured, 'utf8')
     const refs = {}
     let inRefs = false
     for (const line of text.split(/\r?\n/)) {
@@ -105,6 +134,27 @@ function readCredentialRefs() {
   } catch {
     return {}
   }
+}
+
+/**
+ * 一个密钥的三级来源，先到先得：
+ *
+ *   1. `config.json` 直写（`upstreamKey` / `adminKey`）—— 最直白，推荐给「别人」；
+ *   2. 环境变量（`BUDDYKEY_UPSTREAM_KEY` / `BUDDYKEY_ADMIN_KEY`）—— 适合容器与 CI；
+ *   3. `~/.dsh/.credentials.yaml` 的 refs 段 —— 本机旧路径，保持兼容。
+ *
+ * 返回 `{ value, source }`，`source` 会原样出现在 `/healthz` 与管理页上，
+ * 这样「配了没生效」和「压根没配」能一眼分开，不必去翻代码猜。
+ */
+function resolveSecret({ direct, envName, refName }) {
+  const clean = (value) => (typeof value === 'string' ? value.trim() : '')
+  const fromConfig = clean(direct)
+  if (fromConfig !== '') return { value: fromConfig, source: 'config' }
+  const fromEnv = clean(process.env[envName])
+  if (fromEnv !== '') return { value: fromEnv, source: 'env' }
+  const fromRefs = clean(CREDS[refName])
+  if (fromRefs !== '') return { value: fromRefs, source: 'refs' }
+  return { value: '', source: 'none' }
 }
 
 function send(res, status, headers, body) {
@@ -204,6 +254,31 @@ function scopeOf(record) {
 
 /* ──────────────────────────── 上游池子信息 ──────────────────────────── */
 
+/**
+ * CPA 的 IP 级封禁：连续输错管理密钥会触发
+ * `403 {"error":"IP banned due to too many failed attempts. Try again in 29m41s"}`。
+ *
+ * 这是**陌生人第一次配错密钥最可能撞上**的东西，而原始 JSON 看起来像程序坏了。
+ * 所以这里把它翻译成能照做的中文，并带上剩余等待时间。
+ * 顺带把 `no-admin-key` 也在这里统一成人话 —— 两个原因完全不同的失败，
+ * 在页面上不该长得一样。
+ */
+function explainUpstreamError(raw) {
+  const text = String(raw ?? '')
+  if (text === 'no-admin-key') {
+    return '还没配置管理密钥（adminKey）。CPA 的账号列表与登录流程都要它，去 data/config.json 里填，或跑 npm run setup。'
+  }
+  if (text.includes('IP banned') === true) {
+    const wait = /Try again in ([0-9hms ]+)/.exec(text)
+    const left = wait === null ? '' : `还剩约 ${wait[1].trim()}。`
+    return `CPA 把这个 IP 临时封了：连续输错的次数太多。${left}等它到期即可，别继续重试（每次失败都会重新计时）。数据面 /v1 通常不受影响。`
+  }
+  if (text.includes('invalid management key') === true) {
+    return '管理密钥不对（CPA 回 invalid management key）。adminKey 要 management.secret-key 的明文，不是那个 bcrypt 哈希。'
+  }
+  return text
+}
+
 /** 打一次 CPA 管理接口（带管理 key）。 */
 async function cpaAdmin(path, init = {}) {
   const response = await fetch(`${CONFIG.upstream}${path}`, {
@@ -221,7 +296,9 @@ async function cpaAdmin(path, init = {}) {
   } catch {
     parsed = { raw: text }
   }
-  if (!response.ok) throw new Error(`CPA ${String(response.status)}: ${JSON.stringify(parsed).slice(0, 200)}`)
+  if (!response.ok) {
+    throw new Error(`CPA ${String(response.status)}: ${JSON.stringify(parsed).slice(0, 200)}`)
+  }
   return parsed
 }
 
@@ -281,7 +358,7 @@ async function listAccounts() {
       lifecycleAuto: accountsBody?.lifecycle_auto === true,
     }
   } catch (error) {
-    return { ok: false, error: String(error?.message ?? error) }
+    return { ok: false, error: explainUpstreamError(error?.message ?? error) }
   }
 }
 
@@ -290,19 +367,31 @@ const loginSessions = new Map()
 
 let poolCache = { at: 0, value: undefined }
 
-/** 读 workbuddy 的账号 + 余额，给管理页显示「池子里还有多少」。缓存 30 秒。 */
+/**
+ * 读 workbuddy 的账号 + 余额，给管理页显示「池子里还有多少」。缓存 30 秒。
+ *
+ * ⚠️ 必须检查 `response.ok`。CPA 失败时回的是 `{error: "..."}`，
+ *   不检查就会把封禁 / 密钥错误当成「账号列表为空」：
+ *   `accountsBody?.accounts ?? []` 得到 `[]`，页面显示 `ok:true, accountCount:0`，
+ *   用户看到的是「池子空了」而不是「读不到」—— 这两种状态必须分开。
+ */
 async function readPool() {
   const now = Date.now()
   if (poolCache.value !== undefined && now - poolCache.at < 30000) return poolCache.value
-  if (ADMIN_KEY === '') return { ok: false, error: 'no-admin-key' }
+  if (ADMIN_KEY === '') return { ok: false, error: explainUpstreamError('no-admin-key') }
   try {
     const headers = { authorization: `Bearer ${ADMIN_KEY}` }
     const [accountsRes, creditsRes] = await Promise.all([
       fetch(`${CONFIG.upstream}/v0/management/plugins/${CONFIG.channel}/accounts`, { headers }),
       fetch(`${CONFIG.upstream}/v0/management/plugins/${CONFIG.channel}/credits`, { headers }),
     ])
-    const accountsBody = await accountsRes.json()
-    const creditsBody = await creditsRes.json()
+    const accountsText = await accountsRes.text()
+    const creditsText = await creditsRes.text()
+    if (!accountsRes.ok) {
+      throw new Error(`CPA ${String(accountsRes.status)}: ${accountsText.slice(0, 200)}`)
+    }
+    const accountsBody = parseJsonText(accountsText, {})
+    const creditsBody = parseJsonText(creditsText, {})
     const nicknames = new Map()
     for (const account of accountsBody?.accounts ?? []) {
       nicknames.set(account.auth_index, account.nickname ?? account.auth_index)
@@ -342,7 +431,7 @@ async function readPool() {
     }
     return poolCache.value
   } catch (error) {
-    return { ok: false, error: String(error?.message ?? error) }
+    return { ok: false, error: explainUpstreamError(error?.message ?? error) }
   }
 }
 
@@ -892,7 +981,7 @@ async function adminApi(request, response, url) {
       poolCache = { at: 0, value: undefined }
       return jsonRes(response, { ok: true })
     } catch (error) {
-      return jsonRes(response, { ok: false, error: String(error?.message ?? error) }, 502)
+      return jsonRes(response, { ok: false, error: explainUpstreamError(error?.message ?? error) }, 502)
     }
   }
 
@@ -909,7 +998,7 @@ async function adminApi(request, response, url) {
       loginSessions.set(String(data.state), { url: data.url, startedAt: Date.now() })
       return jsonRes(response, { ok: true, state: data.state, url: data.url })
     } catch (error) {
-      return jsonRes(response, { ok: false, error: String(error?.message ?? error) }, 502)
+      return jsonRes(response, { ok: false, error: explainUpstreamError(error?.message ?? error) }, 502)
     }
   }
 
@@ -929,7 +1018,7 @@ async function adminApi(request, response, url) {
       }
       return jsonRes(response, { ok: true, status })
     } catch (error) {
-      return jsonRes(response, { ok: false, error: String(error?.message ?? error) }, 502)
+      return jsonRes(response, { ok: false, error: explainUpstreamError(error?.message ?? error) }, 502)
     }
   }
 
@@ -944,7 +1033,7 @@ async function adminApi(request, response, url) {
       loginSessions.delete(state)
       return jsonRes(response, { ok: true })
     } catch (error) {
-      return jsonRes(response, { ok: false, error: String(error?.message ?? error) }, 502)
+      return jsonRes(response, { ok: false, error: explainUpstreamError(error?.message ?? error) }, 502)
     }
   }
 
@@ -960,6 +1049,21 @@ async function adminApi(request, response, url) {
       ok: true,
       models: ['deepseek-v4.1', 'deepseek-v4.1-flash'],
       channel: CONFIG.channel,
+      /**
+       * 首次上手要用：页面在「一个号都没有」时据此给出具体缺什么、去哪配，
+       * 而不是只画一句「读不到账号」让用户去翻 README。
+       */
+      setup: {
+        upstream: CONFIG.upstream,
+        upstreamKey: UPSTREAM_KEY === '' ? 'missing' : 'ok',
+        adminKey: ADMIN_KEY === '' ? 'missing' : 'ok',
+        upstreamKeyFrom: UPSTREAM.source,
+        adminKeyFrom: ADMIN.source,
+        configFile: CONFIG_FILE,
+        envNames: [CONFIG.upstreamKeyEnv, CONFIG.adminKeyEnv],
+        refsFile: path.join(os.homedir(), '.dsh', '.credentials.yaml'),
+        boundModel: CONFIG.model,
+      },
       pool,
       keys: store.keys.map((item) => {
         const stat = byKey.get(item.id)
@@ -1093,6 +1197,10 @@ const server = http.createServer((request, response) => {
       )
     }
     if (url.pathname === '/healthz') {
+      /**
+       * 把两个密钥的**来源**也报出来。
+       * 「配了没生效」和「压根没配」的排查路径完全不同，靠 `missing` 一个词分不开。
+       */
       return jsonRes(response, {
         ok: true,
         model: CONFIG.model,
@@ -1100,6 +1208,8 @@ const server = http.createServer((request, response) => {
         upstream: CONFIG.upstream,
         upstreamKey: UPSTREAM_KEY === '' ? 'missing' : 'ok',
         adminKey: ADMIN_KEY === '' ? 'missing' : 'ok',
+        upstreamKeyFrom: UPSTREAM.source,
+        adminKeyFrom: ADMIN.source,
         keys: store.keys.length,
       })
     }
@@ -1118,11 +1228,25 @@ const server = http.createServer((request, response) => {
 /** 启动时回放当天账本，否则每次重启当日额度就被清空（限额形同虚设）。 */
 seedDayUsage()
 
+const SOURCE_LABEL = { config: 'config.json', env: '环境变量', refs: '.credentials.yaml', none: '未配置' }
+
 server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`BuddyKey listening on http://${CONFIG.host}:${CONFIG.port}`)
   console.log(`  管理页   http://${CONFIG.host}:${CONFIG.port}/`)
   console.log(`  允许模型 ${CONFIG.model}（渠道 ${CONFIG.channel}）`)
-  console.log(`  上游     ${CONFIG.upstream}   key=${UPSTREAM_KEY === '' ? '缺失' : '已取到'}`)
-  console.log(`  管理 key ${ADMIN_KEY === '' ? '缺失（池子余额不显示）' : '已取到'}`)
+  console.log(
+    `  上游     ${CONFIG.upstream}   key=${UPSTREAM_KEY === '' ? '缺失' : '已取到'}（来源 ${SOURCE_LABEL[UPSTREAM.source]}）`,
+  )
+  console.log(
+    `  管理 key ${ADMIN_KEY === '' ? '缺失（池子余额与账号列表都不显示）' : '已取到'}（来源 ${SOURCE_LABEL[ADMIN.source]}）`,
+  )
   console.log(`  数据目录 ${DATA_DIR}`)
+  if (UPSTREAM_KEY === '' || ADMIN_KEY === '') {
+    console.log('')
+    console.log('  ⚠️ 还差 CPA 密钥，这个进程现在只能用来看页面。二选一：')
+    console.log(`     A) 编辑 ${CONFIG_FILE}，写 "upstreamKey" 与 "adminKey"`)
+    console.log(`     B) 设环境变量 ${CONFIG.upstreamKeyEnv} / ${CONFIG.adminKeyEnv}`)
+    console.log('     取值位置：CPA 的 config.yaml 里 access.api-keys 与 management.secret-key（明文形态）。')
+    console.log('     也可以先跑 `npm run setup` 交互式填一遍。')
+  }
 })

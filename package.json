@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check lib/ui.mjs",
-    "check:docs": "pwsh -NoProfile -File tools/check-docs.ps1"
+    "check": "node --check server.mjs && node --check lib/ui.mjs && node --check tools/setup.mjs",
+    "check:docs": "pwsh -NoProfile -File tools/check-docs.ps1",
+    "setup": "node tools/setup.mjs"
   }
 }
