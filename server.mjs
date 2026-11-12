@@ -658,6 +658,228 @@ async function narrowToScope(authIndexes) {
   }
 }
 
+/* ──────────────────────────── 连通性自检 ──────────────────────────── */
+
+/**
+ * 「现在到底能不能用」—— 页面上要能一眼看见，而不是等客户端报错才发现。
+ *
+ * 四个探针，各管一件事：
+ *   1. data  —— 拿 upstreamKey 打 `/v1/models`：这条就是客户端真正走的那条路；
+ *   2. admin —— 拿 adminKey 打 `auth-files`：账号列表与登录都靠它；
+ *   3. tunnel—— 从 cloudflared 的日志里读出公网地址与 metrics 端口，
+ *               再探 metrics 判断隧道进程是不是还活着（本地、快）；
+ *   4. keys  —— 每把 key 最近一次调用成功与否（从账本读，不发请求）。
+ *
+ * 刻意**不**自动去 fetch 公网地址：那是绕一圈公网回来，慢且会消耗一次自检请求。
+ * 要验「公网真的通」就点页面上的按钮，走 `POST /admin/api/health/tunnel`。
+ */
+
+/** 隧道日志里 `cloudflared` 会打印 `https://<随机词>.trycloudflare.com`。 */
+const TUNNEL_LOG = path.join(DATA_DIR, 'tunnel.log')
+const TUNNEL_URL_RE = /https:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com/gi
+const TUNNEL_METRICS_RE = /Starting metrics server on (127\.0\.0\.1:\d+)/gi
+const TUNNEL_CONNECTOR_RE = /Generated Connector ID:\s*([0-9a-fA-F-]{36})/g
+
+function readTunnelFacts() {
+  let text = ''
+  let updatedAt = null
+  try {
+    const stat = fs.statSync(TUNNEL_LOG)
+    /**
+     * 只读前 128 KB：公网地址、metrics 端口、connector id 都在进程刚起来的那几十行里。
+     * 隧道跑久了日志会很大，整份读进来纯属浪费（而且它在 data/ 里，可能上过百 MB）。
+     */
+    const length = Math.min(stat.size, 128 * 1024)
+    const buffer = Buffer.alloc(length)
+    const fd = fs.openSync(TUNNEL_LOG, 'r')
+    try {
+      fs.readSync(fd, buffer, 0, length, 0)
+    } finally {
+      fs.closeSync(fd)
+    }
+    text = buffer.toString('utf8')
+    updatedAt = stat.mtime.toISOString()
+  } catch {
+    return {
+      logFile: TUNNEL_LOG,
+      logExists: false,
+      url: null,
+      metricsTarget: null,
+      connectorId: null,
+      updatedAt: null,
+    }
+  }
+
+  const urls = [...text.matchAll(TUNNEL_URL_RE)].map((match) => match[0])
+  const metrics = [...text.matchAll(TUNNEL_METRICS_RE)].map((match) => match[1])
+  const connectors = [...text.matchAll(TUNNEL_CONNECTOR_RE)].map((match) => match[1])
+  return {
+    logFile: TUNNEL_LOG,
+    logExists: true,
+    /** 重启会换域名，取最后一次出现的那个。 */
+    url: urls.length === 0 ? null : urls[urls.length - 1],
+    /** 端口也可能换，同样取最后一个。 */
+    metricsTarget: metrics.length === 0 ? null : metrics[metrics.length - 1],
+    /**
+     * 这条隧道进程的**身份**。
+     *
+     * ⚠️ 光探 metrics 端口通不通是不够的：那个端口（默认 20241）是全局的，
+     *   机器上任何一条 cloudflared 都能占着它。只按「端口有响应」下结论，
+     *   会把「别人的隧道」认成「日志里这条隧道还活着」，
+     *   然后在页面上显示一个早已失效的公网地址（踩过：测试隧道一跑，
+     *   生产页面就误报「运行中」，配的还是旧域名）。
+     *   所以必须拿 connectorId 与 metrics 回来的值比对。
+     */
+    connectorId: connectors.length === 0 ? null : connectors[connectors.length - 1],
+    updatedAt,
+  }
+}
+
+/** 探 cloudflared 的 metrics 端口，并核对 connector id 是不是日志里那条。 */
+async function probeTunnelProcess(metricsTarget, expectedConnectorId) {
+  if (metricsTarget === null) return { alive: false, reason: 'no-metrics-target' }
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 1500)
+    const response = await fetch(`http://${metricsTarget}/ready`, { signal: controller.signal })
+    clearTimeout(timer)
+    const text = await response.text().catch(() => '')
+    if (response.ok !== true) {
+      return { alive: false, status: response.status, reason: 'metrics-not-ready' }
+    }
+    let parsed = null
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      parsed = null
+    }
+    const seenConnector = typeof parsed?.connectorId === 'string' ? parsed.connectorId : null
+    if (expectedConnectorId !== null && seenConnector !== expectedConnectorId) {
+      return {
+        alive: false,
+        reason: 'connector-mismatch',
+        seenConnector,
+        expectedConnector: expectedConnectorId,
+      }
+    }
+    return {
+      alive: true,
+      status: response.status,
+      readyConnections: typeof parsed?.readyConnections === 'number' ? parsed.readyConnections : null,
+      connectorId: seenConnector,
+    }
+  } catch (error) {
+    return { alive: false, reason: String(error?.message ?? error).slice(0, 120) }
+  }
+}
+
+/** 拿数据面探一次 `/v1/models` —— 与客户端调模型走同一条路。 */
+async function probeDataPlane() {
+  if (UPSTREAM_KEY === '') return { ok: false, reached: false, reason: 'no-upstream-key' }
+  const startedAt = Date.now()
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 5000)
+    const response = await fetch(`${CONFIG.upstream}/v1/models`, {
+      headers: { authorization: `Bearer ${UPSTREAM_KEY}` },
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+    const text = await response.text().catch(() => '')
+    return {
+      ok: response.ok === true,
+      reached: true,
+      status: response.status,
+      ms: Date.now() - startedAt,
+      body: text.slice(0, 160),
+    }
+  } catch (error) {
+    return { ok: false, reached: false, ms: Date.now() - startedAt, reason: String(error?.message ?? error) }
+  }
+}
+
+/** 每把 key 最近一次调用：成功 / 失败 / 还没用过。 */
+function lastCallByKey() {
+  const latest = new Map()
+  for (const row of readUsage()) {
+    if (typeof row?.keyId !== 'string') continue
+    const previous = latest.get(row.keyId)
+    if (previous === undefined || String(row.ts ?? '') > String(previous.ts ?? '')) {
+      latest.set(row.keyId, row)
+    }
+  }
+  const out = new Map()
+  for (const [keyId, row] of latest) {
+    const status = Number(row.status ?? 0)
+    out.set(keyId, {
+      at: row.ts ?? null,
+      status: Number.isFinite(status) ? status : null,
+      ok: Number.isFinite(status) ? status >= 200 && status < 300 : false,
+      account: row.account ?? null,
+      error: typeof row.error === 'string' ? row.error : null,
+      ms: typeof row.ms === 'number' ? row.ms : null,
+    })
+  }
+  return out
+}
+
+async function readHealth() {
+  const tunnel = readTunnelFacts()
+  const [data, tunnelProcess] = await Promise.all([
+    probeDataPlane(),
+    probeTunnelProcess(tunnel.metricsTarget, tunnel.connectorId),
+  ])
+  const admin = ADMIN_KEY === ''
+    ? { ok: false, reached: false, reason: 'no-admin-key' }
+    : await (async () => {
+        const startedAt = Date.now()
+        try {
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), 5000)
+          const response = await fetch(`${CONFIG.upstream}/v0/management/auth-files`, {
+            headers: { authorization: `Bearer ${ADMIN_KEY}` },
+            signal: controller.signal,
+          })
+          clearTimeout(timer)
+          const text = await response.text().catch(() => '')
+          return {
+            ok: response.ok === true,
+            reached: true,
+            status: response.status,
+            ms: Date.now() - startedAt,
+            hint: response.ok === true ? null : explainUpstreamError(`CPA ${String(response.status)}: ${text.slice(0, 200)}`),
+          }
+        } catch (error) {
+          return { ok: false, reached: false, ms: Date.now() - startedAt, reason: String(error?.message ?? error) }
+        }
+      })()
+
+  const lastCalls = lastCallByKey()
+  return {
+    ok: data.ok === true,
+    checkedAt: new Date().toISOString(),
+    upstream: { url: CONFIG.upstream, keyFrom: UPSTREAM.source, data, admin },
+    tunnel: {
+      running: tunnelProcess.alive === true,
+      publicUrl: tunnel.url,
+      metricsTarget: tunnel.metricsTarget,
+      connectorId: tunnel.connectorId,
+      logFile: tunnel.logFile,
+      logExists: tunnel.logExists,
+      updatedAt: tunnel.updatedAt,
+      process: tunnelProcess,
+      /** 公网可达性是「点了才测」，默认 null = 没测过。 */
+      publicOk: null,
+    },
+    keys: store.keys.map((item) => ({
+      id: item.id,
+      name: item.name,
+      enabled: item.enabled !== false,
+      lastCall: lastCalls.get(item.id) ?? null,
+    })),
+  }
+}
+
 /* ─────────────────────────────── 转发层 ─────────────────────────────── */
 
 function readBody(request) {
@@ -1041,6 +1263,7 @@ async function adminApi(request, response, url) {
     const usage = readUsage()
     const summary = usageSummary(usage)
     const byKey = new Map(summary.map((row) => [row.keyId, row]))
+    const lastCalls = lastCallByKey()
     const pool = await readPool()
     const nicknames =
       pool.ok === true ? new Map(pool.accounts.map((a) => [a.authIndex, a.nickname])) : new Map()
@@ -1068,6 +1291,15 @@ async function adminApi(request, response, url) {
       keys: store.keys.map((item) => {
         const stat = byKey.get(item.id)
         const scope = scopeOf(item)
+        const lastCall = lastCalls.get(item.id) ?? null
+        /**
+         * 「现在还能不能调」与「上次调用成不成」是两件事。
+         *
+         * ⚠️ 429 不写账本（设计如此：不消耗上游），所以被限流的 key 的 `lastCall`
+         *   会**一直停在成功那次**。只看 `lastCall` 会得出「一切正常」的错误结论。
+         *   这里把本地的额度判断也算出来，让页面能直接说「当前被限额拦住」。
+         */
+        const refusal = quotaRefusal(item)
         return {
           id: item.id,
           name: item.name,
@@ -1080,6 +1312,10 @@ async function adminApi(request, response, url) {
           credit: stat?.credit ?? 0,
           today: todayOf(item.id),
           quota: quotaOf(item),
+          /** 这把 key「现在能不能用」的直接证据：最近一次调用成不成。 */
+          lastCall,
+          /** 现在这一刻是否会被额度闸门拦下（`null` = 不会被拦）。 */
+          blocked: refusal === null ? null : { message: refusal.message, limit: refusal.limit },
           scope: {
             mode: scope.mode,
             accounts: scope.accounts.map((authIndex) => ({
@@ -1095,6 +1331,61 @@ async function adminApi(request, response, url) {
         }
       }),
     })
+  }
+
+  if (pathname === '/admin/api/health' && request.method === 'GET') {
+    return jsonRes(response, await readHealth())
+  }
+
+  /**
+   * 「公网真的通吗」—— 只有点了才走这条路。
+   *
+   * 从本机去 fetch 自己的 trycloudflare 地址，流量要绕出去再从隧道回来，
+   * 一次几百毫秒到几秒。所以不放进自动轮询，做成显式动作。
+   */
+  if (pathname === '/admin/api/health/tunnel' && request.method === 'POST') {
+    const tunnel = readTunnelFacts()
+    if (tunnel.url === null) {
+      return jsonRes(
+        response,
+        { ok: false, reason: 'no-public-url', hint: '云隧道日志里还没有公网地址，先跑 start-tunnel.cmd。' },
+        409,
+      )
+    }
+    const startedAt = Date.now()
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 8000)
+      const probe = await fetch(`${tunnel.url}/healthz`, { signal: controller.signal })
+      clearTimeout(timer)
+      const text = await probe.text().catch(() => '')
+      let parsed
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        parsed = null
+      }
+      return jsonRes(response, {
+        ok: probe.ok === true,
+        publicUrl: tunnel.url,
+        status: probe.status,
+        ms: Date.now() - startedAt,
+        health: parsed,
+        checkedAt: new Date().toISOString(),
+      })
+    } catch (error) {
+      return jsonRes(
+        response,
+        {
+          ok: false,
+          publicUrl: tunnel.url,
+          ms: Date.now() - startedAt,
+          reason: String(error?.message ?? error),
+          hint: '隧道进程可能已经退出。重新跑 start-tunnel.cmd 再来。',
+        },
+        502,
+      )
+    }
   }
 
   if (pathname === '/admin/api/usage' && request.method === 'GET') {
