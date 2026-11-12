@@ -28,8 +28,13 @@ npm run check:docs            # 文档相对链接 + 换行约定（tools/check-
 
 ## 验证快照
 
-- 语法：`npm run check` 通过（`server.mjs` + `lib/ui.mjs`）。
+- 语法：`npm run check` 通过（`server.mjs` + `lib/ui.mjs`）；`npm run check:docs` 0 失效链接、换行合规。
 - 真机：登录 / 账号列表 / 单模型放行 / 公网隧道调用 均已验过（2026-11-12）。
+- **线上进程已换成新代码**（2026-11-12 18:57，pid 见 `data/server.log`）：
+  `127.0.0.1:8318` 覆盖启动一次，`/healthz` 200 `keys:2`，首页 43 KB、
+  两个占位符无残留、含 `--hairline:#e8e8ed`（新 UI 生效），
+  用真实 key 实调一次 `deepseek-v4.1-flash` 得 200 并落号 `b6cb402f71d99636`，
+  两把真实 key 的当日用量（12 次 / 2.21 积分、4 次 / 0 积分）经账本回放后一致。
 - **日额度 + 账号范围：已验收**（2026-11-12，隔离副本 8399 + 真实 CPA 8317）：
 
   | 项 | 结论 | 关键证据 |
