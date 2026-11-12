@@ -76,6 +76,20 @@ npm run check:docs            # 文档相对链接 + 换行约定（tools/check-
   所以「按 key 记账里的 `account`」在失败请求上恒为空。别把空 `account` 当成调度异常。
 - **`/favicon.ico` 会命中转发层**：现在落进 `proxy()` 的 `not_found` 分支回 401 类错误，
   浏览器控制台会有一条红字。不影响功能，但别误判成页面报错。
+- **`git push` 别信 `gh` 的绿灯**：本机全局配了
+  `http.https://github.com/.proxy=socks5h://127.0.0.1:7897`，但那个端口当时没有进程在听。
+  `github.com:443` 的 TCP 能连、TLS 握手被阻断，于是 push 直接超时；
+  而 `api.github.com:443` 是通的，所以 `gh repo view` / `gh api` 全绿 ——
+  很容易误判成 token 权限问题。解法：remote 走 SSH 的 443 口
+  （`git@ssh.github.com:cslkkl/<repo>.git`），并且**必须**显式
+  `-o ProxyCommand=none`，否则 `~/.ssh/config` 里那条
+  `ProxyCommand connect -S 127.0.0.1:7897` 会把连接再丢给那个不存在的代理。
+
+  ```powershell
+  git remote set-url origin git@ssh.github.com:cslkkl/<repo>.git
+  $env:GIT_SSH_COMMAND='ssh -o ProxyCommand=none -o StrictHostKeyChecking=accept-new'
+  git push -u origin main
+  ```
 
 ## 文档地图
 

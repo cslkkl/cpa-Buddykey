@@ -81,6 +81,15 @@
   6. `docs: AGENTS 维护索引、验证快照与 PLAN 勾选`
 - [x] `gh repo create cpa-Buddykey --private --source=. --push`。
 - [x] 推送后核对 GitHub 上没有 `data/`、没有 `bin/cloudflared.exe`。
+      证据：远端 `git/trees/main?recursive=1` 里 `data/*` 0 个、`bin/*` 0 个、`*.log` 0 个。
+
+> **push 失败的坑（已记进 AGENTS.md 活跃坑）**：本机全局配了
+> `http.https://github.com/.proxy=socks5h://127.0.0.1:7897`，但那个端口当时没有进程在听。
+> `github.com:443` 的 TCP 能连、TLS 握手被阻断 → `git push` 超时；
+> 而 `api.github.com:443` 是通的，所以 `gh repo view` / `gh api` 全绿，
+> 只有 push 失败，极易误判成 token 权限问题。
+> 解法：remote 改走 SSH 的 443 口，并且必须显式 `-o ProxyCommand=none`
+> （否则 `~/.ssh/config` 那条 `connect -S 127.0.0.1:7897` 会把连接再丢给不存在的代理）。
 
 > 关于第 4/5 条为什么没拆成 `core` / `quota` / `scope` 三个提交：
 > `server.mjs` 是单个文件，`quota` 依赖 `dayUsage`、`scope` 依赖 `cpaAdmin`，
