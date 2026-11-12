@@ -127,6 +127,20 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 
   也就是说：**「别人拉下来能不能用」这条目标已达成**，前提是那人已有可用的 CPA 与已登录账号。
 
+- **连通状态与 key 可用性显示（已验收，2026-11-12 20:46）**：
+
+  | 场景 | 结果 |
+  | --- | --- |
+  | 数据面探针（真 CPA） | `ok:true`，HTTP 200，3ms |
+  | 管理面探针（真 CPA） | `ok:true`，60ms |
+  | 隧道未启动 | `running:false`、`reason: fetch failed`，圆点红，页脚提示「手机在外面用不了」 |
+  | 隧道运行中 | `running:true`、connector 匹配、`readyConnections:1` |
+  | 点「测公网」 | **200**，2336ms，回连的 `healthz` 里 `upstreamKey/ adminKey` 都 ok，页脚变「三条都通」 |
+  | 停掉隧道后 | 立刻回到 `running:false` |
+  | 别人的隧道占着 20241 | 正确判 `connector-mismatch`，不误报运行中 |
+  | 每把 key 的「上次调用」 | `上次调用成功 200 · 899ms · 落号 0f4f3a92`；没调过的显示「还没用过」 |
+  | 额度用完的 key | `blocked` 生效，显示「今日额度已满，现在调用会被 429 拦下」而不是假绿 |
+
 ## 待办
 
 见 [docs/PLAN.md](docs/PLAN.md)。A / B / C / D / E 五节全部完成，
@@ -134,6 +148,14 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 
 ## 活跃坑
 
+- **cloudflared 的 metrics 端口是全局的**：默认 `127.0.0.1:20241`，机器上任何一条隧道都能占着它。
+  只探「端口有响应」会把**别人的隧道**认成日志里那条还活着，
+  然后在页面上显示一个早已失效的公网地址（实测踩过：起一条测试隧道，生产页面立刻误报「运行中」）。
+  解法：拿 `tunnel.log` 里的 `Generated Connector ID` 与 `/ready` 回来的 `connectorId` 比对，
+  不一致判 `connector-mismatch`。改这段逻辑时别把它简化回「端口通就算活」。
+- **429 不写账本，所以 `lastCall` 会骗人**：被日额度拦下的 key 上一次真正记账还是成功那次。
+  只显示 `lastCall` 会得出「一切正常」的错误结论。`/admin/api/state` 因此额外给了
+  `blocked`（当前是否会被额度闸门拦住），页面优先显示它。
 - **CPA 有 IP 级失败封禁**：连续用错的管理密钥打 `/v0/management/*` 会被封约 30 分钟，
   报 `403 {"error":"IP banned due to too many failed attempts. Try again in 29m41s"}`，
   而且**每次重试都重新计时**。数据面 `/v1/*` 不受影响。
@@ -149,6 +171,9 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 - **`Start-Process -Environment` 带 USERPROFILE 会崩**：本机会报
   `subprocess-local: Windows Job runner exited with exit code 4294967295`。
   模拟空 HOME 要用 `cmd /c "set USERPROFILE=…&& …"` 包装。
+- **重启服务要看端口真的释放**：`taskkill` 之后端口可能短暂停在 `CLOSED`（进程没退干净），
+  这时新进程报 `EADDRINUSE` 而旧进程已经不服务请求了 —— 页面看起来"活着"其实是僵尸。
+  `netstat -ano | findstr :8318` 看到 `LISTENING` 行才动手。
 - **流式 chunk 必须先 `Buffer.from(chunk)`** 再 `toString('utf8')`；
   直接对 `Uint8Array` 调 `toString('utf8')` 得到 `"104,101,…"`，usage 永远为 0 且无报错。
 - **HTTP 头只能是 ASCII**：中文 key 名字塞进响应头会让 `writeHead` 抛错。

@@ -227,6 +227,42 @@ CPA 的 IP 封禁到期后，在**真实 CPA + 真实账号池**上把整条链�
 的人，clone → `npm run setup`（两分钟内）→ `npm start` → 打开页面 →
 登录/建 key → 发出第一个请求，全程不需要改代码、不需要作者这台机器的任何东西。
 
+### E5. 页面上显示「打通了没有」—— 已完成（2026-11-12 20:46）
+
+目标原话的后半句：*apikey 是否打通、隧道能否正常使用也要显示在上面。*
+
+新增「连通状态」卡片，三条彼此独立、红绿一眼可见：
+
+| 探针 | 怎么测 | 失败时说什么 |
+| --- | --- | --- |
+| 模型调用（数据面） | 拿 `upstreamKey` 真打 `/v1/models` | 连不上显示上游地址与原因；回非 200 说「密钥可能不对」 |
+| 账号管理（管理面） | 拿 `adminKey` 打 `auth-files` | 复用 `explainUpstreamError`：缺密钥 / 密钥错 / IP 封禁 + 剩余时间 |
+| 公网隧道 | 读 `tunnel.log` 拿地址 + metrics 端口 + connector id，探 `/ready` | 未运行就明确说「手机在外面用不了，本机与同一 Wi-Fi 不受影响」 |
+
+「公网是否真的可达」做成**点了才测**（`POST /admin/api/health/tunnel`）：
+从本机 fetch 自己的 trycloudflare 地址要绕一圈公网，不该进自动轮询。
+
+每把 key 那行补了「上次调用成功/失败 + 状态码 + 耗时 + 落号」，以及 `blocked`
+（当前会不会被额度闸门拦）。后者是必需的：429 不写账本，被限流的 key 的 `lastCall`
+会停在成功那次，光看它会得出「一切正常」的错误结论。
+
+**实测证据**（8318 生产 + 真 cloudflared 隧道）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 数据面 | `ok:true`，HTTP 200，3ms |
+| 管理面 | `ok:true`，60ms |
+| 隧道未启动 | `running:false`、`fetch failed`、红点、页脚提示手机用不了 |
+| 隧道运行中 | `running:true`、connector 匹配、`readyConnections:1` |
+| 点「测公网」 | **200**、2336ms、回连 `healthz` 两个 key 都 ok、页脚变「三条都通：本机、局域网、公网都能用」 |
+| 停隧道后 | 立刻回 `running:false` |
+| 每把 key | `上次调用成功 200 · 899ms · 落号 0f4f3a92`；没调过显示「还没用过」 |
+
+**过程中挖出的一个真 bug**：`cloudflared` 的 metrics 端口（默认 20241）是**全局**的。
+第一版只探「端口有没有响应」，结果我起了一条测试隧道，生产页面立刻误报「运行中」，
+还显示早就失效的旧域名。改成拿日志里的 `Generated Connector ID` 与 `/ready` 返回的
+`connectorId` 比对，不一致判 `connector-mismatch` —— 现在这种串台会被明确识别出来。
+
 ## 三、另一个项目的搬迁（未完成，可延后）
 
 `dsh-cpa-switch` 仍在 `Desktop\dsh-cpa-switch`，目标位置是 `Desktop\Projects\dsh-cpa-switch`。
