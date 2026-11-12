@@ -9,13 +9,22 @@
 - **key 明文只在本机**：`data/keys.json`；列表只暴露遮罩串。
 - **范围还原必须在 `finally`**：漏了会让别的客户端看到被截窄的池子，且**无告警**。
 - **零依赖**：不引 npm 包；`lib/` 只放纯计算与静态资源。
+- **密钥来源三级**：`data/config.json` > 环境变量 > `~/.dsh/.credentials.yaml` 的 refs。
+  改了顺序要同步 `/healthz` 的 `*From` 字段与管理页引导卡片。
 
 ## 常用命令
 
 ```bash
 npm start                     # 启动（等价 node server.mjs）
-npm run check                 # 语法自检（server.mjs + lib/ui.mjs）
+npm run setup                 # 首次配置：一问一答写 data/config.json
+npm run check                 # 语法自检（server.mjs + lib/ui.mjs + tools/setup.mjs）
 npm run check:docs            # 文档相对链接 + 换行约定（tools/check-docs.ps1）
+```
+
+`npm run setup` 也支持全参数非交互模式，方便远程指导别人粘一段命令：
+
+```bash
+node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 ```
 
 验收要在**隔离副本**里跑，别污染 `data/`：
@@ -24,6 +33,11 @@ npm run check:docs            # 文档相对链接 + 换行约定（tools/check-
 # 复制 server.mjs + lib/ 到临时目录，造一份改过端口的 data/config.json，
 # 再 npm start 之外直接 node server.mjs，用 8399 之类的空端口跑。
 # 这样真实 key 明文、真实账本一行都不会被测试写脏。
+#
+# 要模拟「别人刚 clone、什么都没配」：把 USERPROFILE / HOME 指到一个空目录。
+# Start-Process 的 -Environment 带这两个变量在本机会让 job runner 报
+# 「exit code 4294967295」，改用 cmd 包装：
+#   cmd /c "set USERPROFILE=EMPTY&& set HOME=EMPTY&& cd /d REPO && node server.mjs > o.log 2> e.log"
 ```
 
 ## 验证快照
@@ -58,20 +72,51 @@ npm run check:docs            # 文档相对链接 + 换行约定（tools/check-
   - 明文 key 只展示一次并带「复制」按钮（`navigator.clipboard` 失败时 `execCommand` 兜底）。
   - 错误就地展示（清空名称后弹层内出现「请先给这把 key 起个名字」），弹层不关闭，无 `alert`/`confirm`/`prompt`。
 
+- **「别人拉下来能用」已验收**（2026-11-12，隔离副本 8354 + 空 HOME）：
+
+  | 场景 | 结果 |
+  | --- | --- |
+  | 全不配 | `upstreamKey=missing from=none`、`adminKey=missing from=none` |
+  | `config.json` 直写 | 两个都 `from=config` |
+  | 环境变量 | 两个都 `from=env` |
+  | config + env 混合 | `upstreamKey from=config`、`adminKey from=env`（优先级正确） |
+  | clone → 建 key | `ok:true`，拿到 `sk-pool-…` |
+  | clone → 调模型 | **HTTP 200**，落号 `e9252b1d9ddc2b36`，账本 +1 行 |
+  | `/v1/models` | 两个别名；不支持的模型 404 `model_not_found` |
+  | 空 HOME + 空密钥 | 管理页显示「还差一步就能用」三条步骤 + 配置文件绝对路径 |
+  | CPA 封禁期间读池子 | `ok:false` + 「CPA 把这个 IP 临时封了……还剩约 26m」 |
+  | `npm run setup` 交互 / 非交互 | 都能写 `data/config.json`；上游 key 从 CPA `access.api-keys` 自动嗅探成 `sk-cpa-local-2026` |
+
+  未验（受 CPA 的 IP 封禁限制）：配好密钥后引导卡片是否收起；陌生人走完「登录 → 入池 → 建 key → 调用」整链。
+
 ## 待办
 
-见 [docs/PLAN.md](docs/PLAN.md)。A / B / C 三节已全部完成（含推到 `cslkkl/cpa-Buddykey`），
-剩下的是 D 节里两条校验 —— 已用本项目自带的 `npm run check:docs` 覆盖，
-以及一个可延后的 `dsh-cpa-switch` 搬迁。
+见 [docs/PLAN.md](docs/PLAN.md)。A / B / C / D / E 五节全部完成，
+只剩一个可延后的 `dsh-cpa-switch` 搬迁。
 
 ## 活跃坑
 
+- **CPA 有 IP 级失败封禁**：连续用错的管理密钥打 `/v0/management/*` 会被封约 30 分钟，
+  报 `403 {"error":"IP banned due to too many failed attempts. Try again in 29m41s"}`，
+  而且**每次重试都重新计时**。数据面 `/v1/*` 不受影响。
+  所以：**别用假管理密钥去测真 CPA**（本文档的验收就是这样把这台机器封了 30 分钟），
+  要测「密钥错误」的分支就对打桩上游测。`tools/setup.mjs` 也已经改成空 key 时不打管理接口，
+  免得用户还没开始配就被封。
+- **`readPool()` 曾经把失败当空池**：CPA 出错时回 `{error: "..."}`，不检查 `response.ok`
+  就会走 `accountsBody?.accounts ?? []` 得到 `[]`，返回 `ok:true, accountCount:0` ——
+  页面显示「池子是空的」，用户以为号没了。任何读上游的地方都必须先看状态码。
+- **`lib/ui.mjs` 整个文件是一个模板字符串**：里面写注释不能出现反引号，
+  否则模板提前结束，报 `SyntaxError: Unexpected identifier`。
+  同理不能出现 `${`（会被当真插值）。改完跑 `npm run check` + 数一下反引号行数（应为 6）。
+- **`Start-Process -Environment` 带 USERPROFILE 会崩**：本机会报
+  `subprocess-local: Windows Job runner exited with exit code 4294967295`。
+  模拟空 HOME 要用 `cmd /c "set USERPROFILE=…&& …"` 包装。
 - **流式 chunk 必须先 `Buffer.from(chunk)`** 再 `toString('utf8')`；
   直接对 `Uint8Array` 调 `toString('utf8')` 得到 `"104,101,…"`，usage 永远为 0 且无报错。
 - **HTTP 头只能是 ASCII**：中文 key 名字塞进响应头会让 `writeHead` 抛错。
 - **解析请求体不能用按文件路径读的函数**：曾让每把 key 都叫「未命名」，HTTP 200。
 - **启动必须回放当日账本**（`seedDayUsage`）：否则重启把当日额度清零，限额形同虚设。
-- **`data/` 与 `bin/` 不进 git**：前者含 key 明文，后者是 52 MB 二进制。
+- **`data/` 与 `bin/` 不进 git**：前者含 key 明文（含 `config.json` 里 CPA 那两个密钥），后者是 52 MB 二进制。
 - **还原发生在响应之后，不是响应之前**：`forwardToUpstream()` 里已经 `response.end()`，
   `finally { await restore() }` 才逐个 PATCH 回 CPA。实测响应返回瞬间启用集合仍是截窄的 2 个，
   约 1～2 次探测轮询（≈100ms）后才回到 8。同进程的并发请求被 `withScopeLock` 挡住，

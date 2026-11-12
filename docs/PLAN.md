@@ -1,8 +1,8 @@
 # BuddyKey 交接与后续计划
 
 > 这份文档给「换一个工作区继续做」的人（或未来的自己）看。
-> 结论先行：**A 节验收已完成，B 节 UI 重做已完成，C 节发布已完成。**
-> 剩下的只有 D 节收尾里还没跑的两条校验，以及一个可延后的搬迁。
+> 结论先行：**A 节验收、B 节 UI 重做、C 节发布、E 节「别人拉下来能用」都已完成。**
+> 剩下的只有一个可延后的 `dsh-cpa-switch` 搬迁。
 
 ## 一、当前进度
 
@@ -19,6 +19,7 @@
 | UI 重做（Apple 极简） | **已完成** | `lib/ui.mjs`，见下 B 节 |
 | 建 GitHub 仓库并推送 | **已完成** | `cslkkl/cpa-Buddykey`（private） |
 | 文档网络（README / AGENTS / ARCHITECTURE / notes） | 完成 | `AGENTS.md` 已补验证快照与活跃坑 |
+| **别人 clone 下来能配好并发出请求** | **已完成** | 见下 E 节 |
 
 验收环境：`server.mjs` + `lib/` 复制到 `%TEMP%` 下的隔离副本，端口 8399（UI 用 8398），
 `data/config.json` 只改端口。这样真实 `data/` 里的 key 明文与账本一行都没被测试写脏。
@@ -108,6 +109,63 @@
 > 当前结果：0 个失效链接、换行全部符合约定。
 > 顺带修掉两个真问题：`start.cmd` / `start-tunnel.cmd` 是 LF（cmd.exe 依赖 CRLF）、
 > `package.json` 被 PowerShell 写成了 CRLF。
+
+### E. 「别人拉下来能不能用」—— 已完成（2026-11-12）
+
+目标原话：*检查现在是不是别人拉取这个项目就可以登录然后获取 api 了，一直到达到这个功能。*
+
+**结论：原来不能，现在能了。** 原来唯一断点是「两个 CPA 密钥没有地方可配」——
+`readCredentialRefs()` 只读 `~/.dsh/.credentials.yaml`，那是作者这台机器上
+dsh-cpa-switch 生成的，别人 clone 下来必然读不到，于是账号列表 `no-admin-key`、
+登录 `CPA 401`、调模型 `upstreamKey missing`。
+
+改了三处：
+
+- [x] **凭据三级来源**：`config.json` 直写 > `BUDDYKEY_UPSTREAM_KEY` / `BUDDYKEY_ADMIN_KEY`
+      环境变量 > `~/.dsh/.credentials.yaml` 的 refs（旧路径，保持兼容）。
+      `/healthz` 与 `/admin/api/state` 都会报 `upstreamKeyFrom` / `adminKeyFrom`
+      （`config` / `env` / `refs` / `none`），「配了没生效」和「压根没配」能一眼分开。
+- [x] **`npm run setup`**（`tools/setup.mjs`）：一问一答写 `data/config.json`（先备份），
+      上游 key 自动从 CPA 的 `access.api-keys` 嗅探，管理密钥让用户粘明文，
+      写完立刻校验一次并说明结果。也支持全参数非交互模式。
+- [x] **管理页首次上手引导**：`/admin/api/state` 多了 `setup` 段；
+      页面在「密钥没配全 / 池子里没号」时显示「还差一步就能用」卡片，
+      逐条列出缺什么、当前来源、该填哪个字段、配置文件绝对路径、可用的环境变量名。
+      配好或登录过就自动收起。
+
+顺手修掉两个真 bug：
+
+- [x] **`readPool()` 不检查 HTTP 状态码**：CPA 失败时回 `{error: "..."}`，
+      `accountsBody?.accounts ?? []` 得到 `[]`，于是返回 `ok:true, accountCount:0` ——
+      页面显示「池子是空的」而不是「读不到」。封禁 / 密钥错误时会误导用户以为号没了。
+- [x] **CPA 的 IP 封禁没有翻译**：连续输错管理密钥会触发
+      `403 {"error":"IP banned due to too many failed attempts. Try again in 29m41s"}`，
+      原始 JSON 丢给用户看起来就像程序坏了。现在统一翻译成能照做的中文并带剩余时间。
+
+**验证证据**（隔离副本 + 独立 HOME，端口 8354）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 三级来源 A：全不配 | `upstreamKey=missing from=none` / `adminKey=missing from=none` |
+| 三级来源 B：`config.json` 直写 | 两个都是 `from=config` |
+| 三级来源 C：环境变量 | 两个都是 `from=env` |
+| 三级来源 D：config + env 混合 | `upstreamKey from=config`、`adminKey from=env`（优先级正确） |
+| 陌生人 clone → 建 key | `ok:true`，返回 `sk-pool-…` |
+| 陌生人 clone → 调模型 | **HTTP 200**，落号 `e9252b1d9ddc2b36`，`usage.jsonl` 增加 1 行 |
+| `/v1/models` | 返回两个别名 `deepseek-v4.1` / `deepseek-v4.1-flash` |
+| 不支持的模型 | 404 `model_not_found` |
+| 空 HOME + 空密钥 → 引导卡片 | 显示「缺 上游 API key、管理密钥」+ 三条步骤 + 配置文件绝对路径 |
+| 封禁期间读池子 | `ok:false` + 「CPA 把这个 IP 临时封了……还剩约 26m」 |
+
+**还没验到的**（受 CPA 的 IP 封禁限制，封禁是本次测试自己打出来的，约 30 分钟）：
+
+- 「配好密钥后，引导卡片收起」这条 —— 需要管理面恢复后才能验。
+- 陌生人走完「登录 WorkBuddy 账号 → 账号进池 → 建 key → 调用」的完整链路。
+  其中「建 key → 调用」已单独验过（见上表），只差登录那一段。
+
+> ⚠️ 复现这段测试时注意：CPA 对 `/v0/management/*` 有 IP 级失败计数，
+> 用假管理密钥测试会把这台机器封 30 分钟，且每次重试都重新计时。
+> 要测「密钥错误」的分支，改成对**打桩的上游**测，别对真 CPA 试。
 
 ## 三、另一个项目的搬迁（未完成，可延后）
 
