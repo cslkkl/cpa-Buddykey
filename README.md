@@ -7,7 +7,7 @@
 <p align="center">
   <img alt="Node" src="https://img.shields.io/badge/node-%E2%89%A520-3c873a">
   <img alt="Deps" src="https://img.shields.io/badge/dependencies-0-0071e3">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT-000000">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-000000"></a>
 </p>
 
 ## 它解决什么
@@ -248,4 +248,10 @@ npm run check:docs          # 文档相对链接 + 换行约定
 
 ## License
 
-MIT
+[MIT](LICENSE) —— 随便用、随便改、随便分发，出事不担责。
+
+## 贡献
+
+发现问题或想改动就开 issue / PR。
+**提交前请务必确认没有把 `data/`、`runtime/`、`~/.cli-proxy-api/` 里的东西加进来** ——
+那里是你的 API key、管理口令和账号登录态，一旦进了 git 历史就撤不回来。

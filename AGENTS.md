@@ -4,6 +4,11 @@
 
 ## 全局规则
 
+- **绝不把密钥交上去**：这个仓库**是公开的**，而它管的恰好是一堆敏感东西
+  （API key、管理口令、账号登录态）。`data/`、`runtime/`、`bin/` 已被 `.gitignore` 排除，
+  但 `git add -f` 能绕过去 —— 所以有 `tools/check-secrets.mjs` 兜底：
+  `npm run check` 会跑它，`npm run hooks:install` 装的 pre-commit 钩子也会跑它。
+  真提交过一次就**必须作废那个密钥**（重建），删文件没用 —— 别人可能已经 fork。
 - **只放行一个模型**：默认 `wb/deepseek-v4.1-flash`，但**不要写死** —— 启动时从 CPA 探测
   （插件换版本时前缀会从 `wb/` 变 `cn/`，已实测到）。配置里留空 `model` 即走探测。
 - **管理密钥永不下发浏览器**：页面只调本服务 `/admin/api/*`。
@@ -24,10 +29,16 @@ npm run cpa                   # 起上游 CPA
 npm start                     # 起 BuddyKey（等价 node server.mjs）
 npm run setup                 # 只配 BuddyKey 的两个密钥（上游已在别处时用）
 npm run check:updates         # 命令行查上游有没有新版（只读）
+npm run oauth-region cn       # 切登录区域（cn=国内 / intl=国际），改完重启 CPA
 npm run fake-cpa              # 起一个假 CPA（默认 8390），测密钥错误 / 封禁分支用
-npm run check                 # 语法 + 页面结构 + 版本判定自检
+npm run check                 # 语法 + 页面结构 + 平台资产 + 密钥扫描，全跑
+npm run check:secrets         # 只跑密钥扫描（防把真实 key 提交进公开仓库）
+npm run hooks:install         # 装 pre-commit 钩子：提交前自动跑密钥扫描
 npm run check:docs            # 文档相对链接 + 换行约定（tools/check-docs.ps1）
 ```
+
+**新 clone 后第一件事**：`npm run hooks:install` —— 这个仓库是公开的，
+钩子会在 `git commit` 那一刻拦住误提交的密钥，比事后补救有效得多。
 
 `install-cpa` 的三个开关，别记错：
 
@@ -309,6 +320,13 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 - **解析请求体不能用按文件路径读的函数**：曾让每把 key 都叫「未命名」，HTTP 200。
 - **启动必须回放当日账本**（`seedDayUsage`）：否则重启把当日额度清零，限额形同虚设。
 - **`data/` 与 `bin/` 不进 git**：前者含 key 明文（含 `config.json` 里 CPA 那两个密钥），后者是 52 MB 二进制。
+  这条有脚本兜底：`tools/check-secrets.mjs` 会检查「有没有被跟踪的敏感路径」与
+  「内容里有没有真密钥形状」，`npm run check` 与 pre-commit 钩子都会跑。
+  它故意**只认真货的形状**（`sk-pool-` + 32 位十六进制等），不猜占位符写法 ——
+  否则「文档里写 `sk-pool-你的key`」会被误判，检查就被关掉了。
+- **密钥检查有两道，别只留一道**：`npm run check` 是**手动**的，忘了跑就漏；
+  pre-commit 钩子拦在「真要写进 git」那一刻才有效。新 clone 后先 `npm run hooks:install`。
+  钩子会备份已有的 `pre-commit`（`.git/hooks/` 不受版本控制，所以只能靠这条命令装）。
 - **还原发生在响应之后，不是响应之前**：`forwardToUpstream()` 里已经 `response.end()`，
   `finally { await restore() }` 才逐个 PATCH 回 CPA。实测响应返回瞬间启用集合仍是截窄的 2 个，
   约 1～2 次探测轮询（≈100ms）后才回到 8。同进程的并发请求被 `withScopeLock` 挡住，
