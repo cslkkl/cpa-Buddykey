@@ -12,8 +12,9 @@
 - **零依赖**：不引 npm 包；`lib/` 只放纯计算与静态资源，`tools/` 只放脚本。
 - **密钥来源三级**：`data/config.json` > 环境变量 > `~/.dsh/.credentials.yaml` 的 refs。
   改了顺序要同步 `/healthz` 的 `*From` 字段与管理页引导卡片。
-- **第三方二进制只走官方 release 且校验 sha256**：`tools/install-cpa.mjs` 装的所有东西
+- **第三方二进制只走官方 release 且校验 sha256**：`tools/upstream.mjs` 装的所有东西
   都从 GitHub release 下、比对 API 给的 `digest` 后才落盘。别改成「下完直接用」。
+  上游没给 digest 时跳过校验，但必须**如实报 `verified: false`**，不能当成校验通过。
 
 ## 常用命令
 
@@ -22,8 +23,9 @@ npm run install-cpa           # 装上游：下载 CPA + workbuddy 插件 + 生�
 npm run cpa                   # 起上游 CPA
 npm start                     # 起 BuddyKey（等价 node server.mjs）
 npm run setup                 # 只配 BuddyKey 的两个密钥（上游已在别处时用）
+npm run check:updates         # 命令行查上游有没有新版（只读）
 npm run fake-cpa              # 起一个假 CPA（默认 8390），测密钥错误 / 封禁分支用
-npm run check                 # 语法自检（server.mjs + lib/ui.mjs + 全部 tools）
+npm run check                 # 语法 + 页面结构 + 版本判定自检
 npm run check:docs            # 文档相对链接 + 换行约定（tools/check-docs.ps1）
 ```
 
@@ -36,9 +38,24 @@ npm run install-cpa -- --download          # 明确装本项目专用那套
 npm run install-cpa -- --download --force  # 连已下好的也重下
 ```
 
+**上游版本：只报、不自动升级。** 页面「连通状态」下面有一行显示
+「已装 → 上游」，要换得点「更新」。判据是 **release tag 是否相等**，不解析版本号。
+三条不许含糊的口径（与 dsh-cpa-switch 一致，见那边 2026-10-12 决策记录）：
+
+- 没记录过安装 tag → 说「未知」，**不能**说「有新版」也不能说「已是最新」；
+- 查不到上游（断网/限流）→ 说「查不到」，不能说「已是最新」；
+- 认不出响应 → 什么都不说，不印「已是最新」替后端撒谎。
+
+```bash
+node tools/cpa-update.mjs --check          # 只看
+node tools/cpa-update.mjs --apply          # 真换（必须先把 CPA 停掉）
+node tools/cpa-update.mjs --check --key=cpa
+```
+
 **装完之后：模型名不要写死。** `data/config.json` 的 `model` 留空 = 启动时问 CPA；
 插件换版本时前缀会从 `wb/` 变 `cn/`（已实测到），写死会得到「装完都对、一调 400
-unknown provider」这种极难查的失败。
+unknown provider」这种极难查的失败。更新完插件服务端会**重新探测一次**，
+所以别绕过 `/admin/api/updates` 直接手改 `runtime/` 里的文件。
 
 **测上游相关分支一律用 `npm run fake-cpa`，别拿真 CPA 试** —— 它有 IP 级失败封禁。
 
@@ -175,6 +192,28 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
   `/v1/models` 报三个别名，用短名 `deepseek-v4.1-flash` 调用返回 **200**，
   落号 `0f4f3a929bd81dc3`。生产保持探测模式。
 
+- **上游版本检测与更新（2026-11-13 已验收，参考 dsh-cpa-switch 的机制）**：
+
+  | 场景 | 结果 |
+  | --- | --- |
+  | 没记过安装 tag | `installed: null`，页面「已装版本未知（本版未记录）· 上游当前 v0.10.0」+「更新」 |
+  | 记录与上游一致 | `hasUpdate: false`，页面「已是 v0.10.0，与上游一致」，**不给按钮**（绿点） |
+  | 记录旧于上游 | `hasUpdate: true`，页面 `v0.9.9 → v0.10.0` +「更新」 |
+  | 查不到上游 | `ok:false, reason:"release-query-failed"`，页面「查不到上游版本：…」+「重试」 |
+  | 不认识的 `?key=` | HTTP 400 `unknown-source` |
+  | **CPA 在跑时点更新** | **HTTP 409 拒绝**，页面「CPA 还在运行，插件文件被占用…先停掉它」，磁盘 0 字节改动 |
+  | CPA 停着时点更新 | **HTTP 200**，7s 完成下载+校验+解压，`verified:true`，`stopped:true` |
+  | 更新后 | `runtime/install.json` 记下 `tag: v0.10.0`，再查变「已是最新」 |
+  | 更新后重探模型 | 响应带 `model` / `modelSource` / `models`，页面同步 `state.model` |
+  | 首屏不自动查版本 | 只渲染「未知」，点「查上游版本」才打 GitHub（未认证限流 60 次/小时） |
+  | Playwright 实测 | `updateView is not defined` → 定位到注入点在 `<script>` 外，包进去后只剩 favicon 401 |
+  | `npm run check` | 语法 8 个文件 + `check-ui.mjs` 结构断言 + `selftest-update-text.mjs` 六态，全过 |
+  | `node tools/cpa-update.mjs --check` | 真实上游 `v0.10.0`，如实报「未知（本版未记录）」 |
+
+  三条「不许含糊」的口径都有对应断言：没记录 ≠ 有新版、查不到 ≠ 已是最新、认不出就不说话。
+  测试手法：故意把 `runtime/install.json` 的 tag 改旧来造「有新版」，
+  起 `fake-cpa` 来造「CPA 在跑」—— 不用碰真 CPA。
+
 - **连通状态与 key 可用性显示（已验收，2026-11-12 20:46）**：
 
   | 场景 | 结果 |
@@ -238,7 +277,26 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
   页面显示「池子是空的」，用户以为号没了。任何读上游的地方都必须先看状态码。
 - **`lib/ui.mjs` 整个文件是一个模板字符串**：里面写注释不能出现反引号，
   否则模板提前结束，报 `SyntaxError: Unexpected identifier`。
-  同理不能出现 `${`（会被当真插值）。改完跑 `npm run check` + 数一下反引号行数（应为 6）。
+  同理不能出现 `${`（会被当真插值）。
+  ⚠️ **更阴的一种**：两个反引号恰好配对时，`node --check` **照样通过**，
+  页面却被截断成半截 —— 浏览器里表现成「样式没了 / 按钮不响应」，排查方向全跑偏（本轮踩过）。
+  所以不只靠 `--check`，`tools/check-ui.mjs` 直接断言 PAGE 从 `<!doctype html` 开始、
+  到 `</body></html>` 结束、三个占位符各 1 次、五个结构锚点都在。改完跑 `npm run check`。
+- **注入到页面的第三方脚本必须包在独立 `<script>` 里**：
+  `__UPDATE_TEXT__` 一开始被我放在 `<script>` 标签外面，纯文本不会执行，
+  浏览器报 `updateView is not defined`，而服务端一切正常 —— 只看接口测不出来，必须开页面看控制台。
+- **上游版本只报不自动升级**（照 dsh-cpa-switch 的 2026-10-12 决策）：
+  上游随时可能改行为（模型前缀、请求形状都改过），静默替换等于把它的风险直接灌给用户。
+  判据是 **release tag 相等**，不解析 semver —— 两个 tag 都显示，谁新谁旧由人看。
+  「没记录」「查不到」「认不出」三种情况必须显示成**三句不同的话**，
+  混成「已是最新」就是替后端撒谎。
+- **更新插件前必须确认 CPA 停着**：Windows 上被加载的 dll 改不了名。
+  判据是 `probeDataPlane().reached`（**不是** `.ok`）—— CPA 回 401 也说明进程活着、文件被占。
+  只看 `.ok` 会在密钥不对时误判成「没跑」，然后拿一个看不懂的 EBUSY。
+  BuddyKey 不是 CPA 的父进程，所以它**不停也不能停**别人的进程：只检测 + 如实报错。
+- **更新完必须重新探模型目录**：插件换版本时前缀会变（`wb/` ↔ `cn/`）。
+  漏掉这一步会得到「插件更新成功、之后每个请求都 400 unknown provider」，
+  而报错指向 model，完全看不出跟刚才那个更新有关。`POST /admin/api/updates` 里已接。
 - **`Start-Process -Environment` 带 USERPROFILE 会崩**：本机会报
   `subprocess-local: Windows Job runner exited with exit code 4294967295`。
   模拟空 HOME 要用 `cmd /c "set USERPROFILE=…&& …"` 包装。

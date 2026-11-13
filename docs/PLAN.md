@@ -340,6 +340,86 @@ CPA 本体则在 `router-for-me/CLIProxyAPI` 的 release（`v8.0.69`，
 - **`Start-Process -Environment` 带 USERPROFILE 会让 job runner 崩**（本机现象），
   模拟空 HOME 要用 `cmd /c "set USERPROFILE=…"` 包装。
 
+### G. 插件版本可见、可点、可回退 —— 已完成（2026-11-13）
+
+参照 `dsh-cpa-switch` 的 `ops/plugin-update.ts` 与它的决策记录
+（`2026-10-12-plugin-update-path.md`）实现。
+
+#### 那边原来踩过的坑，本项目当时也具备同样条件
+
+`dsh-cpa-switch` 的 `prepare()` 跳过判据是「exe 存在 / dll 数 > 0」，
+于是渠道插件**永远不会更新** —— 本机实测停在上游修 bug 之前的版本，
+而那个 bug 是「整轮对话 500」。而代码注释写着「需要用户显式点重装」，
+那个入口从来不存在。
+
+**BuddyKey 的 `install-cpa` 当时是同一种形状**：`if (sourcePresent(...)) 跳过`，
+且 `install.json` 只记 `mode / port / keys`，**不记 tag** —— 所以连「装的是哪版」都不知道。
+
+#### 照搬的四条决策
+
+| 决策 | 理由（来自那边的记录，本项目同样成立） |
+| --- | --- |
+| **不给自动更新** | 上游随时改行为（模型目录 / 请求形状 / 签到协议都改过），静默升级等于把上游风险灌给用户 |
+| **判据是 tag 相等**，不解析 semver | 零解析、零边界；两个 tag 都显示，谁新谁旧由人看 |
+| **记录「装的是哪个 tag」** | 没有它就无法回答「旧不旧」；老机器没有记录时**如实说未知** |
+| **停 → 换 → 报告，不自动重启** | 替用户决定「重启」与「不越权」的口径相反 |
+
+明确没采用的：靠比对 asset 的 sha256 判有没有新版（`digest` 在旧 release 上可能为空；
+上游重打包不 bump 时误报）；自动重启 CPA。
+
+#### 三句不许含糊的话（有对应断言）
+
+1. **没记录 ≠ 有新版** —— 编 `true` 会催用户换一份可能已经最新的东西，编 `false` 把真话说反。
+2. **查不到上游 ≠ 已是最新** —— 断网 / 限流是一句失败，不是「没有新版」。
+3. **认不出响应就不说话** —— 返回空行不渲染，不印「已是最新」替后端撒谎。
+
+#### 实现分层（与那边同构）
+
+| 本项目的文件 | 对应那边 | 职责 |
+| --- | --- | --- |
+| `lib/update-text.mjs` | `client/update-text.ts` | **纯判据**：吃响应、吐一行话 + 一个动作。无 I/O，可直接测 |
+| `tools/upstream.mjs` | `setup/download.ts` + `setup/install.ts` | 查 / 下 / 校验 / 备份 / 解压 / 记 tag；`force` 是参数 |
+| `tools/cpa-update.mjs` | —（本项目补的命令行） | `--check` / `--apply` |
+| `server.mjs` 的 `/admin/api/updates` | `ops/plugin-update.ts` + 路由 | GET 查、POST 换；**换完重探模型** |
+| `lib/ui.mjs` 的更新行 | `Panel.tsx` + `updateView` | 那一行 + 按钮 |
+| `tools/check-ui.mjs` | （那边靠 TS 类型） | 守模板字符串纪律 |
+
+`install-cpa.mjs` 现在只是交互外壳，下载流水线全部委托 `tools/upstream.mjs` ——
+这样「首次安装」与「强制更新」走**同一份**代码。那边的记录写死了这条：
+强制更新若在外面重写一遍，**第一件被漏掉的通常就是 sha256 校验**。
+
+#### 本项目比那边多的两件事
+
+1. **更新前必须确认 CPA 停着**：`dsh-cpa-switch` 自己管 CPA 进程，能 `runtime.stop()`；
+   BuddyKey 不是 CPA 的父进程，**停不掉也不该杀**别人的进程。
+   所以只在探测到上游可达时**拒绝**并给出具体指令。
+   判据用 `reached` 而不是 `ok` —— 回 401 也说明进程活着、dll 被占用。
+2. **更新完必须重探模型目录**：这是本项目独有的耦合 —— 插件换版本时模型前缀会变
+   （`wb/` ↔ `cn/` 已实测）。漏掉会得到「更新成功但每个请求都 400 unknown provider」，
+   而报错指向 model，完全看不出跟刚才那个更新有关。
+
+#### 验证证据（隔离副本 8377 + `fake-cpa`）
+
+| 场景 | 结果 |
+| --- | --- |
+| 没记过 tag | `installed: null`，页面「已装版本未知…」+「更新」 |
+| 记录与上游一致 | `hasUpdate: false`，页面「已是 v0.10.0，与上游一致」，无按钮 |
+| 记录旧于上游 | `hasUpdate: true`，页面 `v0.9.9 → v0.10.0` +「更新」 |
+| 查不到上游 | `ok:false, reason: release-query-failed` +「重试」 |
+| 不认识的 `?key=` | 400 `unknown-source` |
+| **CPA 在跑时更新** | **409 拒绝**，磁盘 0 字节改动（`plugins/` 目录都没建） |
+| CPA 停着时更新 | **200**，7s 完成，`verified:true`，`stopped:true`，落盘 7.57 MB |
+| 更新后 | `install.json` 记 `tag: v0.10.0`；再查变「已是最新」 |
+| 更新后重探模型 | 响应带 `model` / `modelSource` / `models` |
+| `npm run check` | 8 个文件语法 + UI 结构断言 + 判据六态，全过 |
+
+#### 顺带修的两处
+
+- **`node --check` 抓不住模板字符串被截断**：注释里两个反引号恰好配对时语法照样成立，
+  页面却断成半截。新增 `tools/check-ui.mjs` 直接断言 PAGE 首尾、占位符次数、结构锚点。
+- **注入脚本必须包在 `<script>` 里**：`__UPDATE_TEXT__` 一开始放在标签外，
+  浏览器报 `updateView is not defined` 而服务端一切正常 —— 这类问题只有开页面看控制台才能发现。
+
 ## 三、另一个项目的搬迁（未完成，可延后）
 
 `dsh-cpa-switch` 仍在 `Desktop\dsh-cpa-switch`，目标位置是 `Desktop\Projects\dsh-cpa-switch`。
