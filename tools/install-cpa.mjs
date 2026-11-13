@@ -221,7 +221,7 @@ function readCpaKeys(configFile) {
  * 刻意不抄 config.example.yaml：那份 85 KB、涵盖所有渠道与实验开关，
  * 抄过来等于把一堆与本项目无关的东西塞给用户。
  */
-function buildCpaConfig({ port, apiKey, secretKey, usePluginsDir }) {
+function buildCpaConfig({ port, apiKey, secretKey, usePluginsDir, oauthRegion }) {
   return [
     '# 由 BuddyKey 的 npm run install-cpa 生成。改之前先看 docs/ARCHITECTURE.md。',
     'config-version: 8',
@@ -245,6 +245,18 @@ function buildCpaConfig({ port, apiKey, secretKey, usePluginsDir }) {
     '  configs:',
     '    workbuddy:',
     '      enabled: true',
+    /**
+     * ⚠️ **登录区域必须显式指定**，否则插件默认走国际区（Global）。
+     *
+     * 国际区签发的登录链接是 `codebuddy.ai`，国内账号在那上面登不进去；
+     * 国内区是 `copilot.tencent.com`（`platform=CLI`）。反过来也一样：
+     * 在 `.ai` 上签发的 state 拿到 `.cn` 页面会被拒（HTTP 400）。
+     *
+     * 本项目面向的是国内 WorkBuddy / CodeBuddy 账号（原来那份 v0.9.89 就是 CN 版，
+     * 模型前缀 `wb/`；这个新插件国内区用 `cn/` 前缀），所以默认 `cn`。
+     * 要登国际账号就改成 `intl`，或者用 `--oauth-region intl` 装。
+     */
+    `      oauth_region: ${oauthRegion}`,
     '      checkin_auto: true',
     '',
     'routing:',
@@ -407,6 +419,16 @@ async function main() {
       const apiKey = await pick('上游 API key（BuddyKey 拿它调 CPA）', 'api-key', randomSecret(24))
       const secretKey = await pick('管理密钥（BuddyKey 拿它读账号/登录）', 'secret-key', randomSecret(32))
 
+      /**
+       * 登录区域：`cn` = 国内（copilot.tencent.com），`intl` = 国际（codebuddy.ai）。
+       * 装的时候就要定下来 —— 两者签发的 state 不通用，登录完再改需要重新授权。
+       */
+      const oauthRegion = await pick('登录区域（cn=国内 / intl=国际）', 'oauth-region', 'cn')
+      if (oauthRegion !== 'cn' && oauthRegion !== 'intl') {
+        warn(`不认识的登录区域 "${oauthRegion}"，按 cn 处理。`)
+      }
+      const regionValue = oauthRegion === 'intl' ? 'intl' : 'cn'
+
       if (fs.existsSync(CPA_CONFIG)) {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-')
         const backup = `${CPA_CONFIG}.bak-${stamp}`
@@ -415,12 +437,23 @@ async function main() {
       }
       writeFileAtomic(
         CPA_CONFIG,
-        buildCpaConfig({ port: Number(port) || 8317, apiKey, secretKey, usePluginsDir: pluginsDirName }),
+        buildCpaConfig({
+          port: Number(port) || 8317,
+          apiKey,
+          secretKey,
+          usePluginsDir: pluginsDirName,
+          oauthRegion: regionValue,
+        }),
       )
       say(`  写入 ${path.relative(ROOT, CPA_CONFIG)}`)
       say(
         `    server.port=${String(port)}　access.api-keys=[${apiKey.slice(0, 6)}…]　` +
           `management.secret-key=[${String(secretKey.length)} 字符]`,
+      )
+      say(
+        `    oauth_region=${regionValue}（${
+          regionValue === 'cn' ? '国内，登录走 copilot.tencent.com' : '国际，登录走 codebuddy.ai'
+        }）`,
       )
 
       writeState({

@@ -58,7 +58,9 @@ step "3/6 装上游（CPA 本体 + workbuddy 插件，约 30 MB，等 1-2 分钟
 if [ -f runtime/cpa/config.yaml ]; then
   echo "已经装过了，跳过"
 else
-  node tools/install-cpa.mjs --download --yes --port "$CPA_PORT" --buddy-port "$APP_PORT"
+  # --oauth-region cn：登录走 copilot.tencent.com（国内区）。
+  # 不传的话插件默认 intl，登录链接会是 codebuddy.ai —— 国内账号在那边登不进去。
+  node tools/install-cpa.mjs --download --yes --port "$CPA_PORT" --buddy-port "$APP_PORT" --oauth-region cn
 fi
 
 step "4/6 配成服务器模式（对外可连 + 随机管理口令）"
