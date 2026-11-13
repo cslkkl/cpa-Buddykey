@@ -18,5 +18,6 @@
     "cn/deepseek-v4-flash",
     "wb/deepseek-v4-flash"
   ],
-  "adminPassword": ""
+  "adminPassword": "",
+  "allowedModels": []
 }

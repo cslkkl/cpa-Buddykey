@@ -103,6 +103,17 @@ const DEFAULTS = {
   model: '',
   /** 对外暴露的模型别名。`__AUTO__` = 由探测结果生成，见 `resolveModels`。 */
   acceptModels: [],
+  /**
+   * 允许客户端用的模型。
+   *
+   * 三种模式，按顺序判断：
+   *   1. `model` 非空  → **锁死那一个**（旧行为），其余一律 404；
+   *   2. `model` 空 + `allowedModels` 非空 → 只放行列出来的这些；
+   *   3. 两个都空 → **上游有什么就给什么**（从 CPA 探测，通常 50 多个）。
+   *
+   * 写全名（`cn/glm-5.3`）或去掉前缀的短名（`glm-5.3`）都行。
+   */
+  allowedModels: [],
   /** 探测失败时的兜底，按优先级排。 */
   modelFallback: [
     'cn/deepseek-v4.1-flash',
@@ -311,64 +322,147 @@ function maskOf(key) {
  * `deepseek-v4.1`、或者上游全名都能用，全部归一到同一个上游 id。
  */
 const MODEL_STATE = {
-  /** 最终用的上游模型 id。 */
+  /** 兜底用的上游模型 id（推荐给客户端的那个）。 */
   upstream: '',
-  /** 客户端可以填的别名（含 `upstream` 本身）。 */
+  /** 客户端可以填的全部名字（含全名与短名）。 */
   accept: [],
+  /** 短名 → 上游全名的映射，转发时用。 */
+  aliases: new Map(),
   /** `probe` = 从 CPA 探到的；`config` = 用户写死的；`fallback` = 都没成才用的兜底。 */
   source: 'fallback',
   /** 探测时看到的候选，排好序；`/healthz` 会带上，排查版本问题用。 */
   candidates: [],
+  /** 这一层现在是「锁死一个」还是「可选多个」。 */
+  mode: 'single',
 }
 
+/** `cn/deepseek-v4.1-flash` → `deepseek-v4.1-flash`；也顺带留一个去掉 `-flash` 的。 */
 function shortAliasesOf(upstreamModel) {
-  /** `cn/deepseek-v4.1-flash` → `deepseek-v4.1-flash`、`deepseek-v4.1` */
   const bare = upstreamModel.includes('/') ? upstreamModel.split('/').slice(1).join('/') : upstreamModel
   const out = [upstreamModel, bare]
-  /** 去掉 `-flash` 也留一个：客户端文档里常写短名。 */
   if (bare.endsWith('-flash')) out.push(bare.slice(0, -'-flash'.length))
   return [...new Set(out.filter((item) => item !== ''))]
 }
 
-/** 从候选里挑第一个真实存在的；都不在就取第一个（上游会自己报错，比静默降级好）。 */
+/**
+ * 登记一个上游模型，并给它建别名。
+ *
+ * 别名冲突时不覆盖先到的：`cn/glm-5.3` 与 `cb/glm-5.3` 的短名都是 `glm-5.3`，
+ * 谁先注册谁占住短名，另一个仍可用全名访问 —— 静默覆盖会让「填短名落到另一个区」。
+ */
+function registerModel(upstreamId) {
+  if (!MODEL_STATE.accept.includes(upstreamId)) MODEL_STATE.accept.push(upstreamId)
+  for (const alias of shortAliasesOf(upstreamId)) {
+    if (MODEL_STATE.aliases.has(alias) !== true) MODEL_STATE.aliases.set(alias, upstreamId)
+  }
+}
+
+/**
+ * 决定这一层放行哪些模型。
+ *
+ * 三种模式（见 DEFAULTS 的注释）：
+ *   1. `model` 非空          → 锁死那一个（旧行为）
+ *   2. `allowedModels` 非空  → 只放行列出的
+ *   3. 都空                  → 上游有什么给什么
+ *
+ * 前两种都保留「短名也能用」的便利；第三种直接用探测结果建别名。
+ */
 function resolveModels(availableIds) {
+  const ids = Array.isArray(availableIds) ? availableIds.filter((id) => typeof id === 'string' && id !== '') : []
+  MODEL_STATE.candidates = ids
+  MODEL_STATE.accept = []
+  MODEL_STATE.aliases = new Map()
+
+  /* ── 模式 1：锁死一个 ── */
   if (CONFIG.model !== '') {
+    MODEL_STATE.mode = 'single'
     MODEL_STATE.upstream = CONFIG.model
-    MODEL_STATE.accept = CONFIG.acceptModels.length > 0 ? [...CONFIG.acceptModels] : shortAliasesOf(CONFIG.model)
-    if (!MODEL_STATE.accept.includes(CONFIG.model)) MODEL_STATE.accept.unshift(CONFIG.model)
+    const listed = CONFIG.acceptModels.length > 0 ? CONFIG.acceptModels : shortAliasesOf(CONFIG.model)
+    for (const alias of listed) {
+      if (MODEL_STATE.accept.includes(alias) !== true) MODEL_STATE.accept.push(alias)
+      if (MODEL_STATE.aliases.has(alias) !== true) MODEL_STATE.aliases.set(alias, CONFIG.model)
+    }
+    registerModel(CONFIG.model)
     MODEL_STATE.source = 'config'
     return
   }
 
-  const ids = Array.isArray(availableIds) ? availableIds : []
-  MODEL_STATE.candidates = ids.filter((id) => typeof id === 'string' && id !== '')
-
+  /* 把「探测到的」和「要用作兜底的」合起来，挑第一个真实存在的当推荐项。 */
   const wanted = CONFIG.modelFallback.filter((id) => typeof id === 'string' && id !== '')
-  const hit = wanted.find((candidate) => ids.includes(candidate))
-  if (hit !== undefined) {
-    MODEL_STATE.upstream = hit
-    MODEL_STATE.accept = shortAliasesOf(hit)
+  const fallbackHit = wanted.find((candidate) => ids.includes(candidate))
+  const byShape =
+    ids.find((id) => /deepseek-v4\.1-flash$/.test(id)) ?? ids.find((id) => /deepseek-v4.*flash$/.test(id))
+
+  /* ── 模式 2：白名单 ── */
+  if (CONFIG.allowedModels.length > 0) {
+    MODEL_STATE.mode = 'list'
+    const picked = []
+    for (const item of CONFIG.allowedModels) {
+      const name = String(item ?? '').trim()
+      if (name === '') continue
+      if (ids.length === 0) {
+        /* 没探到目录（CPA 没起 / 没登录）：照用户写的原样登记，别把配置丢掉。 */
+        picked.push(name)
+        continue
+      }
+      const hit =
+        ids.includes(name) === true
+          ? name
+          : ids.find((id) => id.split('/').slice(1).join('/') === name) ??
+            ids.find((id) => id.endsWith(`/${name}`))
+      if (hit !== undefined) picked.push(hit)
+    }
+    const final = picked.length > 0 ? picked : wanted.slice(0, 1)
+    for (const id of final) registerModel(id)
+    MODEL_STATE.upstream = final[0] ?? ''
+    MODEL_STATE.source = ids.length > 0 ? 'probe' : 'fallback'
+    return
+  }
+
+  /* ── 模式 3：上游有什么给什么 ── */
+  MODEL_STATE.mode = 'auto'
+  if (ids.length > 0) {
+    for (const id of ids) registerModel(id)
+    MODEL_STATE.upstream = fallbackHit ?? byShape ?? ids[0]
     MODEL_STATE.source = 'probe'
     return
   }
 
-  /**
-   * 兜底优先级没命中：看看有没有「deepseek-v4.1-flash」结尾的，
-   * 有就说明插件换了前缀，用真实存在的那个比硬用兜底更可能直接可用。
-   */
-  const byShape = ids.find((id) => /deepseek-v4\.1-flash$/.test(id)) ?? ids.find((id) => /deepseek-v4.*flash$/.test(id))
-  if (byShape !== undefined) {
-    MODEL_STATE.upstream = byShape
-    MODEL_STATE.accept = shortAliasesOf(byShape)
-    MODEL_STATE.source = 'probe'
-    return
-  }
-
-  /** 一个都没探到（CPA 没起 / 没登录）：先按兜底走，等 `/admin/api/health` 再探。 */
+  /* 一个都没探到：退回兜底，等 CPA 起来后重启或再探。 */
   const fallback = wanted[0] ?? 'cn/deepseek-v4.1-flash'
+  registerModel(fallback)
   MODEL_STATE.upstream = fallback
-  MODEL_STATE.accept = shortAliasesOf(fallback)
   MODEL_STATE.source = 'fallback'
+}
+
+/**
+ * 把客户端填的模型名解析成上游认可的 id。
+ *
+ * 返回 `null` = 不在放行列表里（调用方回 404，**不静默改写**）。
+ *
+ * ⚠️ 查的是 `aliases` 映射，**不是** `accept` 数组。`accept` 只放上游全名（给
+ * `/v1/models` 列表用）；短名（`glm-5.3`、`deepseek-v4.1`）只登记在 `aliases` 里。
+ * 早先这里判 `accept.includes(asked)`，结果短名一律 404 —— 而列表里压根没有短名，
+ * 用户根本看不出为什么「我照着文档写的名字」用不了。
+ */
+function resolveRequestedModel(asked) {
+  const direct = MODEL_STATE.aliases.get(asked)
+  if (direct !== undefined) return direct
+
+  /** 大小写不敏感兜一次：客户端偶尔把 `DeepSeek` 写成大写。 */
+  const lower = asked.toLowerCase()
+  for (const [alias, target] of MODEL_STATE.aliases) {
+    if (alias.toLowerCase() === lower) return target
+  }
+  return null
+}
+
+/** 对外列出哪些名字可以用：上游全名 + 短名，各去重。 */
+function publicModelList() {
+  const out = []
+  for (const name of MODEL_STATE.accept) if (out.includes(name) !== true) out.push(name)
+  for (const alias of MODEL_STATE.aliases.keys()) if (out.includes(alias) !== true) out.push(alias)
+  return out
 }
 
 /**
@@ -1092,7 +1186,7 @@ async function proxy(request, response, url) {
   if (url.pathname === '/v1/models' && request.method === 'GET') {
     return jsonRes(response, {
       object: 'list',
-      data: MODEL_STATE.accept.map((id) => ({
+      data: publicModelList().map((id) => ({
         id,
         object: 'model',
         created: Math.floor(Date.parse(recordOfKey.createdAt) / 1000),
@@ -1117,19 +1211,22 @@ async function proxy(request, response, url) {
   if (asked === '') {
     return openaiError(response, 400, '缺少 model 参数。', 'missing_model', 'model')
   }
-  if (!MODEL_STATE.accept.includes(asked)) {
-    // 这一层只放行 workbuddy 的 deepseek-v4.1，别的模型明确拒绝 —— 不静默改写。
-    return openaiError(
-      response,
-      404,
-      `本 key 只提供 ${MODEL_STATE.upstream}（${CONFIG.channel} 渠道）。${asked} 不在可用列表里。`,
-      'model_not_found',
-      'model',
-    )
+
+  const target = resolveRequestedModel(asked)
+  if (target === null) {
+    /**
+     * 不在放行列表里就明确拒绝 —— **不静默改写**。
+     * 静默换模型会让用户以为在用 A、实际花的是 B 的额度。
+     */
+    const hint =
+      MODEL_STATE.mode === 'single'
+        ? `这一层只放行 ${MODEL_STATE.upstream}（${CONFIG.channel} 渠道）。`
+        : `可用模型见 GET /v1/models（共 ${String(MODEL_STATE.accept.length)} 个）。`
+    return openaiError(response, 404, `${asked} 不在可用列表里。${hint}`, 'model_not_found', 'model')
   }
 
-  // 一律改写成上游认的那个 id：`deepseek-v4.1` 这类短名也走同一条路。
-  const upstreamBody = JSON.stringify({ ...payload, model: MODEL_STATE.upstream })
+  /** 全名原样转发；短名换成上游认的 id。 */
+  const upstreamBody = JSON.stringify({ ...payload, model: target })
   const startedAt = Date.now()
   const streaming = payload?.stream === true
 
@@ -1836,6 +1933,8 @@ const server = http.createServer((request, response) => {
         ok: true,
         model: MODEL_STATE.upstream,
         modelSource: MODEL_STATE.source,
+        mode: MODEL_STATE.mode,
+        modelCount: MODEL_STATE.accept.length,
         models: MODEL_STATE.accept,
         channel: CONFIG.channel,
         upstream: CONFIG.upstream,
@@ -1905,13 +2004,21 @@ server.listen(CONFIG.port, CONFIG.host, () => {
   } else {
     console.log(`  管理鉴权 已设口令（${String(ADMIN_PASSWORD.length)} 字符）`)
   }
-  console.log(`  允许模型 ${MODEL_STATE.upstream}（渠道 ${CONFIG.channel}，来源 ${MODEL_STATE.source}）`)
-  if (MODEL_STATE.source === 'fallback' && MODEL_STATE.candidates.length === 0) {
-    console.log('           ⚠️ 没能从 CPA 探测到模型目录（上游没起？）。现在用的是兜底名，')
-    console.log('              上游一旦起来、名字对不上就会 400 unknown provider —— 到时重启一次即可。')
+  const MODE_LABEL = {
+    single: '锁死一个',
+    list: '只放行白名单',
+    auto: '上游有什么给什么',
   }
-  if (MODEL_STATE.source === 'probe' && CONFIG.modelFallback[0] !== MODEL_STATE.upstream) {
-    console.log(`           （插件换了前缀：兜底猜的 ${CONFIG.modelFallback[0]} 不存在，实际用探测到的。）`)
+  console.log(
+    `  可用模型 ${String(MODEL_STATE.accept.length)} 个（${MODE_LABEL[MODEL_STATE.mode]}，来源 ${MODEL_STATE.source}）`,
+  )
+  console.log(`           推荐 ${MODEL_STATE.upstream}`)
+  if (MODEL_STATE.mode === 'auto' && MODEL_STATE.accept.length > 1) {
+    console.log(`           例如 ${MODEL_STATE.accept.slice(0, 4).join('、')} …`)
+  }
+  if (MODEL_STATE.source === 'fallback' && MODEL_STATE.candidates.length === 0) {
+    console.log('           ⚠️ 没能从 CPA 探测到模型目录（上游没起 / 还没登录账号）。现在用的是兜底名，')
+    console.log('              上游一旦起来、名字对不上就会 400 unknown provider —— 到时重启一次即可。')
   }
   console.log(
     `  上游     ${CONFIG.upstream}   key=${UPSTREAM_KEY === '' ? '缺失' : '已取到'}（来源 ${SOURCE_LABEL[UPSTREAM.source]}）`,
