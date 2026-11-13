@@ -56,6 +56,18 @@ npm start                # 起 BuddyKey（另一个窗口）
 **这是唯一需要你本人做的步骤**，因为授权只能人来做。登录完这个号就进池子，
 接着创建 API key 就能用了。
 
+> **不装 npm 包**：这个项目零依赖，`npm install` 不用跑。
+> 需要 Node ≥ 20（仓库带 `.node-version`）。
+
+### 想摆脱「电脑必须开着」
+
+本机部署的代价是：关机就断、隧道每次重启换域名、多设备要连同一台电脑。
+搬到一台常年在线的服务器上就没有这些限制 —— 步骤见
+[部署到服务器](docs/DEPLOY-SERVER.md)。
+
+⚠️ **上公网前必须设管理口令**。管理接口能读账号池、能给自己发 key；
+不设口令时，本项目会**拒绝在非本机地址上启动**，而不是裸奔。
+
 ### 这台机器上已经有 CPA 怎么办
 
 安装器会先探测，找到就**默认复用、不覆盖**：
@@ -212,6 +224,7 @@ CPA 没起，或者 `upstream` 地址不对。先 `curl http://127.0.0.1:8317/v1
 ## 文档
 
 - 设计与防错清单 → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- 搬到服务器（systemd / nginx / 安全组）→ [docs/DEPLOY-SERVER.md](docs/DEPLOY-SERVER.md)
 - 维护索引与常用命令 → [AGENTS.md](AGENTS.md)
 - 交接与后续计划 → [docs/PLAN.md](docs/PLAN.md)
 
