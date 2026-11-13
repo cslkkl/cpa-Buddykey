@@ -24,6 +24,37 @@ import os from 'node:os'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { PAGE } from './lib/ui.mjs'
+import { resolveSourceKey } from './lib/update-text.mjs'
+import { checkUpdate, installSource } from './tools/upstream.mjs'
+
+/**
+ * 页面要用的 `updateView` / `updateResultLine`，从 `lib/update-text.mjs` 现读、现注入。
+ *
+ * 为什么注入源码而不是在页面里再写一份：那两个判定（「没记录 ≠ 有新版」
+ * 「查不到 ≠ 已是最新」）一旦分叉，页面就会替后端撒谎。参考实现把这段
+ * 单独拆成 `update-text.ts` 正是为了只留一份；这里条件更差（页面是 inline script，
+ * 不是模块），所以退回「读同一个文件、剥掉 export 关键字、内联」——
+ * 仍然是**同一份**实现。
+ *
+ * ⚠️ 前提：那个文件必须**没有 import**、且只用 `export` 前缀声明。
+ *   它现在符合；若哪天加了依赖，这里会注入出一段语法错误的脚本，
+ *   页面直接白屏 —— 所以下面检查一次，不合格就不注入。
+ */
+const UPDATE_TEXT_BROWSER = (() => {
+  const file = path.join(path.dirname(fileURLToPath(import.meta.url)), 'lib', 'update-text.mjs')
+  let source = ''
+  try {
+    source = fs.readFileSync(file, 'utf8')
+  } catch {
+    return '/* 读不到 lib/update-text.mjs，页面不显示上游版本那一行 */'
+  }
+  if (/^\s*import\s/m.test(source) === true) {
+    console.log('  ⚠️ lib/update-text.mjs 有 import，跳过内联；页面上游版本那一行不可用。')
+    return '/* update-text 含 import，未内联 */'
+  }
+  /** 注释里的 {@link …} 与 markdown 链接对 JS 无害，只要剥掉 export 就能当普通脚本跑。 */
+  return source.replace(/^export\s+/gm, '')
+})()
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 /** 运行时数据统一放 `data/` —— 代码在根，状态与二进制分开，删状态不影响代码。 */
@@ -487,6 +518,14 @@ async function listAccounts() {
 
 /** 登录会话缓存：`state` → `{ url, startedAt }`，只为界面回显。 */
 const loginSessions = new Map()
+
+/**
+ * 上游版本操作的互斥位：`null` = 空闲，否则是正在处理的来源名。
+ *
+ * 两个动作都要挡：查版本会打 GitHub（限流 60 次/小时），更新会改磁盘。
+ * 同一个进程内并发跑这两件事没有意义，只会让「装的是哪版」这条记录打架。
+ */
+const updates = { inFlight: null }
 
 let poolCache = { at: 0, value: undefined }
 
@@ -1462,6 +1501,111 @@ async function adminApi(request, response, url) {
     return jsonRes(response, await readHealth())
   }
 
+  /* ── 上游版本 ── */
+
+  /**
+   * 查上游有没有新版。
+   *
+   * ⚠️ 与 `/admin/api/state` 分开是有意的：这条路要打一次 GitHub API，
+   *   而未认证限流是 60 次/小时。`state` 会被页面反复轮询，合在一起等于
+   *   每次轮询都去问一次上游 —— 既不礼貌，也会让页面偶尔无故报错。
+   *   （与 dsh-cpa-switch 把 `/plugins-update` 从 `/setup` 里拆出来同一个理由。）
+   *
+   * `?key=` 空着取默认来源（渠道插件）；CPA 本体在页面上不暴露，但机制通用。
+   */
+  if (pathname === '/admin/api/updates' && request.method === 'GET') {
+    const key = resolveSourceKey(url.searchParams.get('key') ?? '')
+    if (key === undefined) {
+      return jsonRes(response, { ok: false, reason: 'unknown-source', error: `不认识的来源：${String(url.searchParams.get('key'))}` }, 400)
+    }
+    if (updates.inFlight !== null) return jsonRes(response, { ok: false, reason: 'busy', error: '上一次检查还没结束' }, 429)
+    updates.inFlight = key
+    try {
+      return jsonRes(response, await checkUpdate(key))
+    } finally {
+      updates.inFlight = null
+    }
+  }
+
+  /**
+   * 更新：**用户点了才换**，从不自动跑。
+   *
+   * 顺序是「先确认 CPA 停着 → 再换文件」。Windows 上被加载的 dll 改不了名，
+   * 所以这里必须先看上游通不通：
+   *   - 通着 → 拒绝，说清楚要先停 CPA（BuddyKey 不是 CPA 的父进程，停不掉它，
+   *     也不去做越权的事：杀一个自己没启动的进程和杀自己的是两件事）；
+   *   - 不通 → 直接换（多半用户已经 Ctrl+C 停了 `npm run cpa`）。
+   *
+   * ⚠️ 换完**不自动起 CPA**，也不自动重连：替用户决定「重启」与
+   *   「不越权」的口径相反。`stopped` 如实回给界面。
+   */
+  if (pathname === '/admin/api/updates' && request.method === 'POST') {
+    const body = parseJsonText(await safeJson(request), {})
+    const key = resolveSourceKey(typeof body.key === 'string' ? body.key : '')
+    if (key === undefined) {
+      return jsonRes(response, { ok: false, reason: 'unknown-source', error: '不认识的来源' }, 400)
+    }
+    if (updates.inFlight !== null) {
+      return jsonRes(response, { ok: false, reason: 'busy', error: '上一次操作还没结束' }, 429)
+    }
+
+    updates.inFlight = key
+    try {
+      /**
+       * ⚠️ 判据是 `reached` 不是 `ok`：CPA 回了 401 也说明**进程活着、dll 已加载**，
+       *   文件照样改不了名。只看 `ok` 会在密钥不对时误判成「CPA 没跑」，
+       *   然后去换一个正被占用的 dll，拿一个看不懂的 EBUSY。
+       */
+      const reachable = await probeDataPlane()
+      if (reachable.reached === true) {
+        return jsonRes(
+          response,
+          {
+            ok: false,
+            reason: 'upstream-running',
+            error:
+              'CPA 还在运行，插件文件被占用、改不了名。先停掉它' +
+              '（跑 npm run cpa 的那个窗口按 Ctrl+C），再来更新。',
+          },
+          409,
+        )
+      }
+
+      const outcome = await installSource(key, { force: true })
+      if (outcome.ok !== true) {
+        return jsonRes(
+          response,
+          { ok: false, reason: outcome.phase ?? 'install-failed', error: outcome.error ?? '未知原因' },
+          502,
+        )
+      }
+
+      /**
+       * ⚠️ 换完必须重新探模型目录：插件换版本时模型前缀会变
+       *   （`wb/` ↔ `cn/`，已实测）。不重探就会「插件更新成功、
+       *   但之后每个请求都 400 unknown provider」，而且报错指向 model，
+       *   完全看不出跟刚才那个更新有关。
+       */
+      await probeModelCatalog()
+
+      return jsonRes(response, {
+        ok: true,
+        key,
+        tag: outcome.tag,
+        name: outcome.name,
+        /** sha256 真校验过没有（上游没给 digest 时是 false）。 */
+        verified: outcome.verified,
+        /** CPA 现在多半是停着的，界面据此提示用户去手动启动。 */
+        stopped: reachable.reached !== true,
+        model: MODEL_STATE.upstream,
+        modelSource: MODEL_STATE.source,
+        models: MODEL_STATE.accept,
+      })
+    } finally {
+      updates.inFlight = null
+    }
+  }
+
   /**
    * 「公网真的通吗」—— 只有点了才走这条路。
    *
@@ -1604,12 +1748,14 @@ const server = http.createServer((request, response) => {
         lan.length === 0
           ? '没有检测到局域网地址'
           : lan.map((ip) => `http://${ip}:${String(CONFIG.port)}`).join(' 或 ')
-      const models = ['deepseek-v4.1', 'deepseek-v4.1-flash'].join(' / ')
+      const models = MODEL_STATE.accept.length > 0 ? MODEL_STATE.accept.join(' / ') : MODEL_STATE.upstream
       return send(
         response,
         200,
         { 'content-type': 'text/html; charset=utf-8' },
-        PAGE.replace('__LAN_HINT__', hint).replace('__MODELS__', models),
+        PAGE.replace('__LAN_HINT__', hint)
+          .replace('__MODELS__', models)
+          .replace('__UPDATE_TEXT__', UPDATE_TEXT_BROWSER),
       )
     }
     if (url.pathname === '/healthz') {
