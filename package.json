@@ -15,6 +15,7 @@
     "fake-cpa": "node tools/fake-cpa.mjs",
     "install-cpa": "node tools/install-cpa.mjs",
     "cpa": "node tools/run-cpa.mjs",
-    "check:updates": "node tools/cpa-update.mjs --check"
+    "check:updates": "node tools/cpa-update.mjs --check",
+    "oauth-region": "node tools/set-oauth-region.cjs"
   }
 }
