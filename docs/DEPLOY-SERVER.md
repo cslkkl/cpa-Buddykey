@@ -7,6 +7,34 @@
 > 先读一句话结论：**不要直接把端口开到公网。**
 > 管理接口能读账号池、能给自己发 key。必须设口令 + 走反向代理，本文第 4 节。
 
+## 懒人版：一条命令
+
+只要机器是 Ubuntu / Debian / CentOS / 阿里云 Linux 之类，root 或能 sudo 就行：
+
+```bash
+git clone https://github.com/cslkkl/cpa-Buddykey.git ~/buddykey
+sudo bash ~/buddykey/tools/deploy-server.sh
+```
+
+它做完第 1、3、4、6 节的全部事情，最后打印公网地址和随机管理口令。
+剩下只有两件人为的事：**放行端口**（第 8 节）、**扫码登录账号**。
+
+脚本认这些环境变量，需要时覆盖：
+
+```bash
+sudo BUDDYKEY_PORT=9000 BUDDYKEY_REGION=intl bash tools/deploy-server.sh
+```
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `BUDDYKEY_DIR` | 当前仓库 / `/opt/buddykey` | 装到哪 |
+| `BUDDYKEY_REPO` | 当前仓库的 origin（自动转成 https） | 从哪克隆 |
+| `BUDDYKEY_PORT` | `8318` | 管理页与 API 端口 |
+| `BUDDYKEY_CPA_PORT` | `8317` | 上游 CPA 端口（只绑 127.0.0.1） |
+| `BUDDYKEY_REGION` | `cn` | 登录区域：`cn` 国内 / `intl` 国际 |
+
+想看每一步在做什么、或者想自己掌控节奏 → 往下读手工版。
+
 ## 0. 为什么值得搬到服务器
 
 | | 本机 | 服务器 |
@@ -31,10 +59,13 @@ node -v    # 需要 >= 20
 
 ```bash
 sudo mkdir -p /opt && cd /opt
-sudo git clone <仓库地址> buddykey
+sudo git clone https://github.com/cslkkl/cpa-Buddykey.git buddykey
 sudo chown -R "$USER":"$USER" buddykey
 cd buddykey
 ```
+
+仓库是公开的，**不需要任何凭据**就能 clone。
+如果你 fork 了自己的版本，把地址换成你那份即可。
 
 不需要 `npm install` —— 这个项目零 npm 依赖。
 
@@ -94,19 +125,31 @@ curl -X POST http://<IP>:8318/admin/api/keys -d '{"name":"白嫖"}'
 设口令（任选一种）：
 
 ```bash
-# A. 写进配置
+# A. 写进配置（推荐；一键脚本就是这么做的，还会顺手存一份到 data/admin-password.txt）
 node -e '
-  const fs=require("fs"); const f="data/config.json";
-  const c=JSON.parse(fs.readFileSync(f,"utf8"));
-  c.adminPassword=require("crypto").randomBytes(12).toString("base64url");
-  fs.writeFileSync(f,JSON.stringify(c,null,2));
+  const fs = require("fs");
+  const f = "data/config.json";
+  const c = JSON.parse(fs.readFileSync(f, "utf8"));
+  c.adminPassword = require("crypto").randomBytes(12).toString("base64url");
+  fs.writeFileSync(f, JSON.stringify(c, null, 2) + "\n");
   console.log("口令：" + c.adminPassword);
 '
 
 # B. 或者交给 systemd 环境变量（见第 6 节）
 ```
 
-然后页面首次打开会弹口令框，输入后存在该标签页里，关掉即失效。
+然后页面首次打开会弹口令框，输入后存在该标签页里，关掉即失效（`sessionStorage`，不写 cookie）。
+
+验证口令真的生效了 —— **这一步别省**：
+
+```bash
+# 期望 401（被挡住），不是 200
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8318/admin/api/state
+
+# 期望 200（带对口令）
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "authorization: Bearer 你的口令" http://127.0.0.1:8318/admin/api/state
+```
 
 ## 6. 用 systemd 常驻
 
@@ -207,41 +250,85 @@ sudo certbot --nginx -d api.example.com
 
 ## 8. 打开云厂商的安全组
 
-华为云 / 阿里云 / 腾讯云都要单独放行端口，**Ubuntu 的 ufw 之外还有一层**：
+云主机的防火墙有**两层**：系统内的 ufw / firewalld，以及控制台的「安全组」。
+两层都放行才通。只改一层是最常见的「明明服务在跑却连不上」原因。
+
+### 两种模式，选一种
+
+**A. 简单模式（一键脚本默认走这条）**
+
+直接开端口，靠**管理口令**挡住 `/admin/api/*`：
+
+| 端口 | 开给谁 | 用途 |
+| --- | --- | --- |
+| 22 | 你的 IP（或 0.0.0.0/0） | SSH / 网页终端 |
+| **8318** | **0.0.0.0/0** | 管理页 + API，**必须有管理口令** |
+| 8317 | 不要开 | CPA 本体，只绑 127.0.0.1 |
+
+适用：自己一个人用，手机要直接连。
+代价：管理页暴露在公网，安全性完全依赖那个口令（以及地址不被扫到）。
+**服务端会在非本机地址 + 无口令时拒绝启动**，所以不会出现「忘了设口令就裸奔」。
+
+**B. 稳妥模式**
+
+只开 80 / 443，用它做反向代理**只转发 `/v1`**，管理页留在本机：
 
 | 端口 | 开给谁 | 用途 |
 | --- | --- | --- |
 | 22 | 你的 IP | SSH |
-| 80 / 443 | 0.0.0.0/0 | 如果走 nginx |
+| 80 / 443 | 0.0.0.0/0 | nginx 反向代理 |
 | 8318 | **不要开** | 管理页，走 SSH 隧道 |
-| 8317 | **不要开** | CPA 本体，只该被本机访问 |
+| 8317 | **不要开** | CPA 本体 |
 
-> 我这边连你服务器的 22 端口是超时的，说明安全组还没放行
-> （或者只对特定 IP 开放）。
+适用：要 HTTPS、要给别人用、不想让管理页暴露。
+完整 nginx 配置与 HTTPS（certbot）见**第 7 节**，这里不重复。
+管理页这样访问：`ssh -L 8318:127.0.0.1:8318 用户@服务器IP`，
+然后开 `http://127.0.0.1:8318/`。
+
+### 各家控制台在哪
+
+| 厂商 | 叫法 | 位置 |
+| --- | --- | --- |
+| 华为云 | 安全组 | 实例详情 → 安全组 → 配置规则 → 入方向 |
+| 阿里云 | 安全组 | ECS → 安全组 → 配置规则 |
+| 腾讯云 | 安全组 | 轻量/CVM → 防火墙 |
+| AWS | Security Group | EC2 → Security → Security Groups |
+| Vultr / DigitalOcean | Firewall | 实例 → Settings → Firewall |
 
 ## 9. 验收清单
 
-搬完之后逐条打勾：
+搬完之后逐条打勾。**前两条不通就别往下试** —— 它们排除的是环境问题，不是配置问题。
 
 ```bash
 # 1. 两个服务都在跑
 systemctl is-active buddykey-cpa buddykey        # 两个都应是 active
 
-# 2. 本机能读管理接口（经 SSH 隧道）
+# 2. 本机能读（服务自身活着）
 curl -s http://127.0.0.1:8318/healthz | head -c 300
+#    关注 modelSource：probe = 从 CPA 真探到了；fallback = 没探到（多半还没登录账号）
 
-# 3. 数据面能调（用创建出来的 key）
+# 3. 管理接口确实被口令挡住（简单模式必查；稳妥模式返回 404 也算对）
+curl -s -o /dev/null -w 'no-auth  -> %{http_code}\n' http://127.0.0.1:8318/admin/api/state
+curl -s -o /dev/null -w 'with-pw  -> %{http_code}\n' \
+  -H "authorization: Bearer 你的口令" http://127.0.0.1:8318/admin/api/state
+#    期望 401 / 200。两个都 200 = 口令没生效，立刻停下来查
+
+# 4. 数据面能真调（用页面创建出来的 key）
 curl -s http://127.0.0.1:8318/v1/chat/completions \
   -H "Authorization: Bearer sk-pool-你的key" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}' \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"max_tokens":10}' \
   | head -c 300
+#    期望 200 且 choices[0].message.content 有内容
 
-# 4. 从公网只能碰 /v1，管理接口被挡住
-curl -s -o /dev/null -w '%{http_code}\n' http://<域名>/admin/api/state   # 应 404
+# 5. 从公网访问（把 IP 换成你的）
+curl -s -o /dev/null -w 'public   -> %{http_code}\n' http://你的IP:8318/healthz
+#    200 = 端口通了。超时 = 安全组没放行（第 8 节）
 ```
 
-## 10. 这台服务器上的两个坑
+第 5 条通了之后，才算「电脑关机也能用」这件事真的成立。
+
+## 10. 服务器上会踩的坑
 
 **① 账号目录是固定的 `~/.cli-proxy-api`。** 同机多份 CPA 共用账号，不会隔离。
 服务器上通常只有一份，问题不大；本机调试时要注意别以为自己「装了个干净的」。
@@ -255,6 +342,24 @@ sudo systemctl start buddykey-cpa
 ```
 
 页面上的「更新」按钮要求 CPA 停着，systemd 管着的时候它会拒绝 —— 这是有意的。
+
+**③ 登录区域要在登录之前定，改区域要重新授权。**
+`cn` 与 `intl` 签发的 OAuth state 不通用（在 `.ai` 上签的拿到 `.cn` 页面会被拒，HTTP 400）。
+所以换区域之后，页面上的旧登录框要先「取消授权」，再点「登录」：
+
+```bash
+sudo npm run oauth-region cn          # cn 国内 / intl 国际
+sudo systemctl restart buddykey-cpa buddykey
+```
+
+**④ 代理 / VPN 会让 `git pull` 卡住而不是失败。**
+国内机器连 `github.com` 可能握手挂住，`git clone` 就一直停在原地（不报错）。
+`api.github.com` 通常是通的 —— 所以安装器只走它。
+真拉不动代码时，用 `curl` 从 `api.github.com` 取，别死等 `git clone`。
+
+**⑤ 带宽是小云机最容易忽略的限制。**
+2 核 4 G 的机器常配 3 Mbit/s 峰值。文字对话完全够；
+但一次长回复几十 KB、多人同时用，就会明显变慢 —— 这不是配置问题，是套餐限制。
 
 ## 11. 想省钱的话
 

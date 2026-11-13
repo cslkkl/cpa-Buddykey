@@ -37,6 +37,23 @@ npm run hooks:install         # 装 pre-commit 钩子：提交前自动跑密钥
 npm run check:docs            # 文档相对链接 + 换行约定（tools/check-docs.ps1）
 ```
 
+**部署到服务器**（别人拿到仓库后最常走的一条路）：
+
+```bash
+git clone https://github.com/cslkkl/cpa-Buddykey.git ~/buddykey
+sudo bash ~/buddykey/tools/deploy-server.sh
+```
+
+脚本自带的三条行为，改之前先看注释：
+
+- **代码目录从脚本位置推**：在仓库里跑就用当前这份，不会往 `/opt` 再克隆一份
+  （否则两份代码，改哪份都不生效）。只有脚本被单独拷出来跑才克隆。
+- **remote 自动归一化**：`git@github.com:` / `ssh://` 一律转 `https://` ——
+  自己 push 用的 SSH remote 在服务器上没有那把私钥，不转会卡在 `Permission denied`。
+- **口令可重跑**：已有 `adminPassword` 就不再生成新的，否则每次部署都把浏览器里存的那个作废。
+
+可覆盖的环境变量见 [docs/DEPLOY-SERVER.md](docs/DEPLOY-SERVER.md) 顶部。
+
 **新 clone 后第一件事**：`npm run hooks:install` —— 这个仓库是公开的，
 钩子会在 `git commit` 那一刻拦住误提交的密钥，比事后补救有效得多。
 
