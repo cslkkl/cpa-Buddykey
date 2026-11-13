@@ -38,14 +38,20 @@ echo "node $(node -v) / git $(git --version | awk '{print $3}')"
 
 step "2/6 取代码"
 if [ -d "$DIR/.git" ]; then
-  cd "$DIR" && git pull --ff-only
+  cd "$DIR"
+  git pull --ff-only || echo "（拉不到新版本，就用本地这份）"
 else
   $SUDO mkdir -p "$(dirname "$DIR")"
   $SUDO git clone --depth 1 "$REPO_URL" "$DIR"
-  $SUDO chown -R "$(id -u):$(id -g)" "$DIR"
   cd "$DIR"
 fi
 cd "$DIR"
+# ⚠️ chown 放在 if 外面：如果别人先 sudo git clone 过这份代码，
+#   目录归 root，后面 node 写 data/ 会 permission denied。
+#   每次部署都纠正一次，代价是一次递归 chown，比排查权限问题便宜。
+if [ "$(id -u)" -ne 0 ]; then
+  $SUDO chown -R "$(id -u):$(id -g)" "$DIR"
+fi
 echo "代码在 $DIR（$(git rev-parse --short HEAD)）"
 
 step "3/6 装上游（CPA 本体 + workbuddy 插件，约 30 MB，等 1-2 分钟）"
