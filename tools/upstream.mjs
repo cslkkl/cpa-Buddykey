@@ -31,6 +31,7 @@ import crypto from 'node:crypto'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { extractZip } from './zip.mjs'
+import { extractArchive } from './tar.mjs'
 import { SOURCE_LABELS, resolveSourceKey } from '../lib/update-text.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -56,6 +57,23 @@ export function platformTag() {
 const PLAT = platformTag()
 
 /**
+ * 资产名里的「架构 token」——**两个来源的拼法不一样**，得分开算。
+ *
+ * 实测上游：
+ *   CPA     → `linux_aarch64`、`windows_aarch64`，但 `darwin_arm64`
+ *   插件    → `linux_arm64`、`windows_arm64`、`darwin_arm64`
+ *
+ * 同一台 ARM 机器，CPA 要 `aarch64`、插件要 `arm64`。写成一个统一 token
+ * 会让 ARM 平台上**某一个**来源永远匹配不到（`tools/selftest-platform-assets.mjs`
+ * 就是为此而写）。x64 两边都是 `amd64`，没问题。
+ */
+function archTokenFor(key, arch) {
+  if (arch !== 'arm64') return arch
+  if (key === 'cpa' && PLAT.os !== 'darwin') return 'aarch64'
+  return 'arm64'
+}
+
+/**
  * 两个来源的定位信息。
  *
  * `exclusiveDir` = 这个来源**独占**落点目录，替换时必须先清空再解压。
@@ -63,6 +81,11 @@ const PLAT = platformTag()
  * 而 CPA 按「磁盘上有什么就加载什么」，于是去加载一个已被撤掉的插件（参考实现踩过）。
  * CPA 本体的目录**不是**独占的 —— `config.yaml` 与 `plugins/` 与 exe 同层，
  * 清空等于顺手删掉用户的配置与插件。
+ *
+ * ⚠️ **上游按平台用了不同容器**：Windows 发 `.zip`，Linux / macOS 发 `.tar.gz`。
+ *   所以资产模式两种都收。另外 Linux 还多一个 `_no-plugin.tar.gz`（不含插件宿主），
+ *   装它会导致渠道根本注册不上 —— 模式里要求 `_<os>_<arch>` 后面**紧跟**扩展名，
+ *   中间夹了 `_no-plugin` 的自然就排除了。
  */
 export function sourceOf(key) {
   if (key === 'cpa') {
@@ -70,7 +93,7 @@ export function sourceOf(key) {
       key,
       label: SOURCE_LABELS.cpa,
       repo: CPA_REPO,
-      assetPattern: new RegExp(`_${PLAT.os}_${PLAT.arch}\\.zip$`, 'i'),
+      assetPattern: new RegExp(`_${PLAT.os}_${archTokenFor('cpa', PLAT.arch)}\\.(zip|tar\\.gz)$`, 'i'),
       targetDir: CPA_DIR,
       exeName: `cli-proxy-api${PLAT.exe}`,
       exclusiveDir: false,
@@ -81,7 +104,10 @@ export function sourceOf(key) {
     label: SOURCE_LABELS.plugins,
     /** 插件仓库要现查 registry 才知道，见 `resolvePluginRepo()`。 */
     repo: '',
-    assetPattern: new RegExp(`^${PLUGIN_ID}_.*_${PLAT.os}_${PLAT.arch}\\.zip$`, 'i'),
+    assetPattern: new RegExp(
+      `^${PLUGIN_ID}_.*_${PLAT.os}_${archTokenFor('plugins', PLAT.arch)}\\.(zip|tar\\.gz)$`,
+      'i',
+    ),
     targetDir: PLUGIN_DIR,
     exeName: `${PLUGIN_ID}${PLAT.lib}`,
     exclusiveDir: true,
@@ -411,7 +437,8 @@ export async function installSource(key, options = {}) {
 
   let entries
   try {
-    entries = extractZip(buffer)
+    /** 按扩展名派发：Windows 是 zip，Linux/macOS 是 tar.gz。 */
+    entries = extractArchive(buffer, asset.name)
   } catch (error) {
     return { ok: false, phase: 'extract', error: String(error?.message ?? error) }
   }
@@ -445,10 +472,19 @@ export async function installSource(key, options = {}) {
   try {
     fs.mkdirSync(source.targetDir, { recursive: true })
     if (key === 'cpa') {
-      /** CPA 包里除了 exe 还有 LICENSE 与 README —— 分发别人的二进制要带上许可证。 */
+      /** CPA 包里除了可执行文件还有 LICENSE 与 README —— 分发别人的二进制要带上许可证。 */
       for (const [name, data] of entries) {
-        const target = name.endsWith(source.exeName) ? path.join(source.targetDir, source.exeName) : path.join(source.targetDir, path.basename(name))
-        writeAtomic(target, data, name.endsWith('.exe') ? 0o755 : undefined)
+        const isExe = name === source.exeName || name.endsWith(`/${source.exeName}`)
+        const target = isExe
+          ? path.join(source.targetDir, source.exeName)
+          : path.join(source.targetDir, path.basename(name))
+        /**
+         * ⚠️ 执行位要按「是不是那个可执行文件」给，不能按扩展名。
+         *   Linux/macOS 的包名是 `cli-proxy-api`（无后缀），按 `.exe` 判断会漏掉它，
+         *   结果文件落盘但没有执行位 —— 起服务时 permission denied，
+         *   而报错发生在下一步，很容易误判成别的问题。
+         */
+        writeAtomic(target, data, isExe ? 0o755 : undefined)
       }
     } else {
       const libEntry = [...entries.entries()].find(([name]) => new RegExp(`\\${PLAT.lib}$`, 'i').test(name))
