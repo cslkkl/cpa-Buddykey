@@ -1,8 +1,11 @@
 # 运行时数据（key 明文、调用账本、隧道日志）—— 不入库
 data/
 
-# cloudflared 二进制，52 MB，用时自己下
+# 第三方二进制：cloudflared 与 CPA 本体 + 插件。
+# 由 `npm run install-cpa` 自动下载到 runtime/，`start-tunnel.cmd` 用 bin/。
+# 都不入库：加起来上百 MB，而且更新走各自的 release。
 bin/
+runtime/
 
 # 编辑器 / 系统
 .vscode/

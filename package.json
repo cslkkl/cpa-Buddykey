@@ -9,9 +9,11 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check lib/ui.mjs && node --check tools/setup.mjs && node --check tools/fake-cpa.mjs",
+    "check": "node --check server.mjs && node --check lib/ui.mjs && node --check tools/setup.mjs && node --check tools/fake-cpa.mjs && node --check tools/zip.mjs && node --check tools/install-cpa.mjs && node --check tools/run-cpa.mjs",
     "check:docs": "pwsh -NoProfile -File tools/check-docs.ps1",
     "setup": "node tools/setup.mjs",
-    "fake-cpa": "node tools/fake-cpa.mjs"
+    "fake-cpa": "node tools/fake-cpa.mjs",
+    "install-cpa": "node tools/install-cpa.mjs",
+    "cpa": "node tools/run-cpa.mjs"
   }
 }
