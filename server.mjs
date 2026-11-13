@@ -2,7 +2,7 @@
  * BuddyKey —— 登录 WorkBuddy 账号，把账号池做成「像控制台那样的具名 API Key」。
  *
  * 为什么需要这一层：CPA 自己的 `access.api-keys` 只是一串裸字符串
- * （实测 `{"api-keys":["sk-cpa-local-2026"]}`），没有名字、没有 Tracking ID、
+ * （实测 `{"api-keys":["sk-cpa-example"]}`），没有名字、没有 Tracking ID、
  * 没有创建/最后使用时间，也不按 key 记账。要做成控制台那种表格、按 key 查用量、
  * 按 key 限额与限号，只能在 CPA 前面加一个很小的网关。
  *

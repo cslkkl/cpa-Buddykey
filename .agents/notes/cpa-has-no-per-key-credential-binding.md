@@ -11,7 +11,7 @@
 不支持。三条证据：
 
 - `access.api-keys` 是纯字符串列表（实测 `GET /v0/management/api-keys` 回
-  `{"api-keys":["sk-cpa-local-2026"]}`），没有对象形态、没有附加字段。
+  `{"api-keys":["sk-cpa-example"]}`），没有对象形态、没有附加字段。
 - `config.example.yaml` 的 `routing` 段只有 `strategy`（round-robin /
   weighted-round-robin / fill-first）、`session-affinity`、`force-model-prefix`、
   `retry`，没有 per-key 选择器。

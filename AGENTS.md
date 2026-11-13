@@ -131,7 +131,7 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
   | `/v1/models` | 两个别名；不支持的模型 404 `model_not_found` |
   | 空 HOME + 空密钥 | 管理页显示「还差一步就能用」三条步骤 + 配置文件绝对路径 |
   | CPA 封禁期间读池子 | `ok:false` + 「CPA 把这个 IP 临时封了……还剩约 26m」 |
-  | `npm run setup` 交互 / 非交互 | 都能写 `data/config.json`；上游 key 从 CPA `access.api-keys` 自动嗅探成 `sk-cpa-local-2026` |
+  | `npm run setup` 交互 / 非交互 | 都能写 `data/config.json`；上游 key 从 CPA `access.api-keys` 自动嗅探成 `sk-cpa-example` |
 
   未验（受 CPA 的 IP 封禁限制）：配好密钥后引导卡片是否收起；陌生人走完「登录 → 入池 → 建 key → 调用」整链。
   → 这两条已在下一节用打桩上游补验完毕。
@@ -157,7 +157,7 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 - **解封后在真机走完整链路（已通过）**：
   8 个号全 `disabled:false`、remain 30429；建带 `selected` + `requestsPerDay:2` 的 key，
   连发 3 次 `200 / 200 / 429` 且全部落在指定 2 个号内、账本只增 2 行、还原后 `enabled=8`；
-  `npm run setup` 自动嗅探到 `sk-cpa-local-2026`、校验读到 16 个凭据文件；
+  `npm run setup` 自动嗅探到 `sk-cpa-example`、校验读到 16 个凭据文件；
   用 setup 产物起服务后 `/healthz` 报 `from: "config"`，建 key + 调模型 **200**。
 
   也就是说：**「别人拉下来能不能用」这条目标已达成**，前提是那人已有可用的 CPA 与已登录账号。

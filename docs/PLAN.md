@@ -219,7 +219,7 @@ CPA 的 IP 封禁到期后，在**真实 CPA + 真实账号池**上把整条链�
 | 429 不写账 | 账本增量 **2**（不是 3） |
 | 范围还原 | 请求后 `enabled` 回到 8 |
 | 清理 | 删掉这把验收 key，回到原有 2 把 |
-| **`npm run setup` 真机全流程** | 自动嗅探到 `sk-cpa-local-2026`、粘管理密钥后 `✓ 读到 16 个凭据文件`、exit 0 |
+| **`npm run setup` 真机全流程** | 自动嗅探到 `sk-cpa-example`、粘管理密钥后 `✓ 读到 16 个凭据文件`、exit 0 |
 | 用 setup 产物起服务 | `/healthz` 报 `upstreamKeyFrom: "config"` / `adminKeyFrom: "config"` |
 | 用 setup 产物建 key + 调用 | 建 key `ok:true`，调 `deepseek-v4.1` **200**，落号 `47c82c4c8415a897` |
 
