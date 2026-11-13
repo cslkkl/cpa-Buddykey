@@ -2,17 +2,13 @@
   "host": "127.0.0.1",
   "port": 8318,
   "upstream": "http://127.0.0.1:8317",
-
   "upstreamKey": "",
   "adminKey": "",
-
   "upstreamKeyEnv": "BUDDYKEY_UPSTREAM_KEY",
   "adminKeyEnv": "BUDDYKEY_ADMIN_KEY",
-
   "credentialsFile": "",
   "upstreamKeyRef": "CPA_API_KEY",
   "adminKeyRef": "CPA_ADMIN_KEY",
-
   "channel": "workbuddy",
   "model": "",
   "acceptModels": [],
@@ -21,5 +17,6 @@
     "wb/deepseek-v4.1-flash",
     "cn/deepseek-v4-flash",
     "wb/deepseek-v4-flash"
-  ]
+  ],
+  "adminPassword": ""
 }

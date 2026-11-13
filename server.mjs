@@ -21,7 +21,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { PAGE } from './lib/ui.mjs'
 import { resolveSourceKey } from './lib/update-text.mjs'
@@ -81,6 +81,15 @@ const DEFAULTS = {
   adminKeyRef: 'CPA_ADMIN_KEY',
   /** 这一层锁死的渠道与模型。 */
   channel: 'workbuddy',
+  /**
+   * 管理接口的口令。
+   *
+   * ⚠️ 空着只在**只绑本机**时允许。`/admin/api/*` 能读账号池、能建 key、能发起登录 ——
+   *   一旦绑到 0.0.0.0 又不设口令，任何能扫到这个端口的人都能给自己发一把 key
+   *   白嫖你的额度（实测确认过：无凭据 POST /admin/api/keys 直接 200 返回可用 key）。
+   *   所以启动时会检查：**非回环地址 + 空口令 = 拒绝启动**，宁可起不来也不裸奔。
+   */
+  adminPassword: '',
   /**
    * 上游模型 id。
    *
@@ -1338,8 +1347,68 @@ function usageSummary(rows, keyId) {
     .sort((a, b) => String(b.lastAt ?? '').localeCompare(String(a.lastAt ?? '')))
 }
 
+/**
+ * 管理接口的鉴权。
+ *
+ * 返回 `null` = 通过；返回字符串 = 该拒绝的理由（直接放进响应）。
+ *
+ * 口令从哪来：`data/config.json` 的 `adminPassword`，或环境变量 `BUDDYKEY_ADMIN_PASSWORD`。
+ * 页面把它存在 `sessionStorage`（关标签就没），每次带 `authorization: Bearer <口令>`。
+ *
+ * 为什么用 Bearer 而不是 Cookie：不用签名、不用管 SameSite、不用处理 CSRF ——
+ * 这个页面对同一个源发请求，加一个头就够；而 Cookie 方案要额外防跨站伪造。
+ */
+const ADMIN_PASSWORD = (() => {
+  const fromEnv = typeof process.env.BUDDYKEY_ADMIN_PASSWORD === 'string' ? process.env.BUDDYKEY_ADMIN_PASSWORD : ''
+  return fromEnv !== '' ? fromEnv : String(CONFIG.adminPassword ?? '')
+})()
+
+function sameSecret(given, expected) {
+  const a = Buffer.from(String(given), 'utf8')
+  const b = Buffer.from(String(expected), 'utf8')
+  /** 长度不同直接失败；`timingSafeEqual` 要求等长，否则抛。 */
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
+
+function adminAuthFailure(request) {
+  /** 没设口令 = 不设防（启动时已保证这只会发生在只绑本机的情况）。 */
+  if (ADMIN_PASSWORD === '') return null
+
+  const raw = request.headers.authorization
+  const header = typeof raw === 'string' ? raw.trim() : ''
+  const bearer = /^Bearer\s+(.+)$/i.exec(header)
+  const token = bearer !== null ? bearer[1].trim() : typeof request.headers['x-admin-token'] === 'string'
+    ? String(request.headers['x-admin-token']).trim()
+    : ''
+
+  if (token === '') return '管理接口需要口令：在页面顶部填入 adminPassword（或环境变量 BUDDYKEY_ADMIN_PASSWORD）。'
+  if (sameSecret(token, ADMIN_PASSWORD) !== true) return '管理口令不对。'
+  return null
+}
+
 async function adminApi(request, response, url) {
   const pathname = url.pathname
+
+  /**
+   * 管理接口的第一道门。
+   *
+   * `adminPassword` 空着时直接放行 —— 但启动时已经拦过「非回环 + 空口令」，
+   * 所以能走到这里的空口令实例一定只绑在本机，别人碰不到。
+   *
+   * 口令比较走 `timingSafeEqual`：`===` 会在第一个不同字节处返回，
+   * 逐字节的耗时差理论上能被用来猜口令。长度不同先挡掉（`timingSafeEqual` 要求等长）。
+   */
+  if (adminAuthFailure(request) !== null) {
+    const failure = adminAuthFailure(request)
+    response.writeHead(401, {
+      'content-type': 'application/json; charset=utf-8',
+      /** 不带 realm 的话浏览器不会弹原生口令框，页面自己处理。 */
+      'www-authenticate': 'Bearer realm="BuddyKey"',
+    })
+    response.end(JSON.stringify({ ok: false, error: failure, code: 'admin_auth_required' }))
+    return
+  }
 
   /* ── 账号 ── */
 
@@ -1803,9 +1872,39 @@ const SOURCE_LABEL = { config: 'config.json', env: '环境变量', refs: '.crede
  */
 await probeModelCatalog()
 
+/**
+ * 安全闸门：非回环地址 + 空管理口令 = 拒绝启动。
+ *
+ * 为什么是「拒绝」而不是「警告后照常起」：警告在终端里滚过去就没了，
+ * 而 `/admin/api/*` 无口令意味着**任何能连上这个端口的人都能给自己发一把 key**
+ * （实测过：无凭据 POST 直接 200 返回可用 key）。这种口子不该靠人自觉。
+ *
+ * 只绑本机时不拦 —— 127.0.0.1 别人碰不到，这是本项目的默认用法。
+ */
+const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1', '']
+if (LOOPBACK_HOSTS.includes(CONFIG.host) !== true && ADMIN_PASSWORD === '') {
+  console.error('')
+  console.error(`拒绝启动：监听地址是 ${CONFIG.host}（不是本机），但没设管理口令。`)
+  console.error('')
+  console.error('这样起的话，任何能连上这个端口的人都能打开管理接口、给自己发一把可用的 key，')
+  console.error('直接消耗你的额度。所以必须先设一个口令，二选一：')
+  console.error('')
+  console.error(`  A) 在 ${CONFIG_FILE} 里加一行： "adminPassword": "<你自己定的口令>"`)
+  console.error('  B) 启动时设环境变量：BUDDYKEY_ADMIN_PASSWORD=<你自己定的口令>')
+  console.error('')
+  console.error('只想本机用（不对外暴露）就把 host 改回 "127.0.0.1"。')
+  console.error('')
+  process.exit(1)
+}
+
 server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`BuddyKey listening on http://${CONFIG.host}:${CONFIG.port}`)
   console.log(`  管理页   http://${CONFIG.host}:${CONFIG.port}/`)
+  if (ADMIN_PASSWORD === '') {
+    console.log('  管理鉴权 未设口令（只绑本机，安全）')
+  } else {
+    console.log(`  管理鉴权 已设口令（${String(ADMIN_PASSWORD.length)} 字符）`)
+  }
   console.log(`  允许模型 ${MODEL_STATE.upstream}（渠道 ${CONFIG.channel}，来源 ${MODEL_STATE.source}）`)
   if (MODEL_STATE.source === 'fallback' && MODEL_STATE.candidates.length === 0) {
     console.log('           ⚠️ 没能从 CPA 探测到模型目录（上游没起？）。现在用的是兜底名，')
