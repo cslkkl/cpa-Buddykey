@@ -263,6 +263,83 @@ CPA 的 IP 封禁到期后，在**真实 CPA + 真实账号池**上把整条链�
 还显示早就失效的旧域名。改成拿日志里的 `Generated Connector ID` 与 `/ready` 返回的
 `connectorId` 比对，不一致判 `connector-mismatch` —— 现在这种串台会被明确识别出来。
 
+### F. 把上游也装进来 —— 已完成（2026-11-13）
+
+目标原话：*这些前提能不能都整合到这个项目里面……别人拉取的时候自动会帮别人搞定一切，
+除了要自己登录账号。*
+
+**原来做不到，现在做到了。** 三条前提里：
+
+| 前提 | 原来 | 现在 |
+| --- | --- | --- |
+| CPA 本体在跑 | 自己想办法装 | `npm run install-cpa` 自动下载 |
+| workbuddy 插件已装 | 自己找（原仓库还 404 了） | 从官方插件商店下载 |
+| 已登录至少一个账号 | 自己登 | **仍需你自己扫码** —— 授权只能人做 |
+
+#### 关键发现：官方插件商店
+
+原文档里记着「插件源仓库 `mmqz/cpa-multi-plugins` 现在 404」。这次找到了正源：
+`router-for-me/CLIProxyAPI-Plugins-Store` 的 `registry.json`（181 个插件），
+其中 `id: workbuddy` 条目指向 `zidanefaqih/codebuddy-intl-cpa`，
+release 提供 6 个平台的 zip，带 `checksums.txt` 与 API 侧 `digest`。
+
+CPA 本体则在 `router-for-me/CLIProxyAPI` 的 release（`v8.0.69`，
+`CLIProxyAPI_8.0.69_windows_amd64.zip`）。
+
+#### 实现
+
+- `tools/install-cpa.mjs`（`npm run install-cpa`）：探测 → 下载 → 解压 → 生成配置 → 写 BuddyKey 配置。
+  - **探测优先**：本机已有 CPA（`~/.dsh/cpa-panel/runtime/cpa` 或 `~/.cli-proxy-api`）就默认复用、
+    不覆盖。要强制装新的一套得显式 `--download`。
+  - **每次都校验 sha256**，对不上不落盘。
+  - 交互与非交互（`--port` / `--api-key` / `--secret-key` / `--yes`）两种模式。
+  - 生成的 `config.yaml` 只开 workbuddy 一个渠道，不抄 85 KB 的 example。
+- `tools/run-cpa.mjs`（`npm run cpa`）：以 CPA 自己的目录为 cwd 启动，转发日志，Ctrl+C 转给子进程。
+- `tools/zip.mjs`：零依赖 zip 解压（stored + deflate），因为项目不引 npm 包而 Node 没有内置解压。
+
+#### 挖出的关键问题：插件前缀变了
+
+装完第一次调用就 400 `unknown provider for model wb/deepseek-v4.1-flash`。查下来：
+
+| 插件版本 | 暴露的模型 id |
+| --- | --- |
+| `workbuddy.dll` v0.9.89（本机旧版，腾讯 CN） | `wb/deepseek-v4.1-flash` |
+| CodeBuddy Intl CPA v0.10.0（商店新版） | `cn/deepseek-v4.1-flash` |
+
+模型名写死会导致「装完什么都对、一调就 400」，而报错指向 model 不指向插件版本，极难查。
+已改成**启动时探测**：`await probeModelCatalog()` 问一次 CPA `/v1/models`，
+按候选优先级挑真实存在的那个，同时接受短别名。
+`/healthz` 的 `modelSource` 报 `probe` / `config` / `fallback`。
+
+#### 验证证据
+
+从零（隔离副本，无 `runtime/`）跑 `--download`：
+
+| 步骤 | 结果 |
+| --- | --- |
+| CPA release | `v8.0.69`（2026-11-12） |
+| 下 CPA zip | 24.8 MB，sha256 ✓ |
+| 解出 exe | `runtime/cpa/cli-proxy-api.exe`，75 MB |
+| 插件商店 | `workbuddy` = CodeBuddy Intl CPA `v0.10.0`（zidanefaqih） |
+| 下插件 zip | 3.2 MB，sha256 ✓ |
+| 解出插件 | `runtime/cpa/plugins/workbuddy.dll`，8 MB |
+| 生成 config | port / api-keys / secret-key 齐全 |
+| `npm run cpa` | `API server started successfully on 127.0.0.1:8320`，插件注册 v0.10.0 |
+| 数据面 / 管理面 | 200 / 200，账号列表 `count=8` |
+| 登录 | 拿到 `codebuddy.ai` 授权地址，`status=wait` |
+| BuddyKey 连它 | `modelSource: "probe"` → `cn/deepseek-v4.1-flash` |
+| 建 key + 调用 | 200，短名 `deepseek-v4.1-flash` 也能用 |
+
+生产环境（旧版插件）也验了探测：`modelSource: "probe"` → `wb/deepseek-v4.1-flash`，
+启动日志打印「兜底猜的 cn/… 不存在，实际用探测到的」，调用 200 落号 `0f4f3a929bd81dc3`。
+
+#### 顺带修的两个 bug
+
+- **`fetch` 的 `ECONNREFUSED` 在 `error.cause.code` 里**，不在 `message`（message 只是 `fetch failed`）。
+  按 message 判断会把「端口没人听」误判成「被占用」，于是明明能起却拒绝启动。
+- **`Start-Process -Environment` 带 USERPROFILE 会让 job runner 崩**（本机现象），
+  模拟空 HOME 要用 `cmd /c "set USERPROFILE=…"` 包装。
+
 ## 三、另一个项目的搬迁（未完成，可延后）
 
 `dsh-cpa-switch` 仍在 `Desktop\dsh-cpa-switch`，目标位置是 `Desktop\Projects\dsh-cpa-switch`。
@@ -303,12 +380,27 @@ CPA 的 IP 封禁到期后，在**真实 CPA + 真实账号池**上把整条链�
 | 东西 | 路径 |
 | --- | --- |
 | 本服务 | `Desktop\BuddyKey` |
-| 入口 | `server.mjs`（HTTP + 转发 + 额度 + 范围） |
+| 入口 | `server.mjs`（HTTP + 转发 + 额度 + 范围 + 模型探测） |
 | 管理页 | `lib/ui.mjs`（`export const PAGE`，Apple 极简风） |
 | 运行时数据 | `data/keys.json`、`data/usage.jsonl`、`data/config.json` |
+| **上游安装器** | `tools/install-cpa.mjs`（`npm run install-cpa`） |
+| **上游启动器** | `tools/run-cpa.mjs`（`npm run cpa`） |
+| **自带上游** | `runtime/cpa/`（exe + plugins/ + config.yaml + install.json） |
 | 文档自检 | `tools/check-docs.ps1`（`npm run check:docs`） |
 | 隧道二进制 | `bin/cloudflared.exe` |
-| CPA 本体 | `~/.dsh/cpa-panel/runtime/cpa/cli-proxy-api.exe`（端口 8317） |
-| 账号登录态 | `~/.cli-proxy-api/workbuddy-*.json` |
-| 管理密钥 | `~/.dsh/.credentials.yaml` 的 `CPA_API_KEY` / `CPA_ADMIN_KEY` |
+| 自建 CPA（若没跑安装器） | `runtime/cpa/cli-proxy-api.exe` |
+| 复用别处的 CPA | `~/.dsh/cpa-panel/runtime/cpa/cli-proxy-api.exe`（端口 8317） |
+| 账号登录态（固定路径） | `~/.cli-proxy-api/workbuddy-*.json` |
+| 管理密钥（旧路径） | `~/.dsh/.credentials.yaml` 的 `CPA_API_KEY` / `CPA_ADMIN_KEY` |
 | GitHub 仓库 | `cslkkl/cpa-Buddykey`（private） |
+
+## 六、外部依赖清单（都是别人维护的，更新走各自 release）
+
+| 依赖 | 来源 | 装到哪 |
+| --- | --- | --- |
+| CPA 本体 | `router-for-me/CLIProxyAPI` release | `runtime/cpa/cli-proxy-api.exe` |
+| workbuddy 插件 | 插件商店 registry → `zidanefaqih/codebuddy-intl-cpa` release | `runtime/cpa/plugins/workbuddy.dll` |
+| cloudflared | 需自己下（不入库） | `bin/cloudflared.exe` |
+
+两个自动下载的都校验 sha256。**插件不是本项目维护的**，它的模型前缀、
+接口行为都可能随后续版本变化 —— 这也是模型名要探测而不能写死的原因。

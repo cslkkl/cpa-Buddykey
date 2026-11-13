@@ -4,23 +4,41 @@
 
 ## 全局规则
 
-- **只放行一个模型**：`wb/deepseek-v4.1-flash`。其余返回 404，不改写。
+- **只放行一个模型**：默认 `wb/deepseek-v4.1-flash`，但**不要写死** —— 启动时从 CPA 探测
+  （插件换版本时前缀会从 `wb/` 变 `cn/`，已实测到）。配置里留空 `model` 即走探测。
 - **管理密钥永不下发浏览器**：页面只调本服务 `/admin/api/*`。
 - **key 明文只在本机**：`data/keys.json`；列表只暴露遮罩串。
 - **范围还原必须在 `finally`**：漏了会让别的客户端看到被截窄的池子，且**无告警**。
-- **零依赖**：不引 npm 包；`lib/` 只放纯计算与静态资源。
+- **零依赖**：不引 npm 包；`lib/` 只放纯计算与静态资源，`tools/` 只放脚本。
 - **密钥来源三级**：`data/config.json` > 环境变量 > `~/.dsh/.credentials.yaml` 的 refs。
   改了顺序要同步 `/healthz` 的 `*From` 字段与管理页引导卡片。
+- **第三方二进制只走官方 release 且校验 sha256**：`tools/install-cpa.mjs` 装的所有东西
+  都从 GitHub release 下、比对 API 给的 `digest` 后才落盘。别改成「下完直接用」。
 
 ## 常用命令
 
 ```bash
-npm start                     # 启动（等价 node server.mjs）
-npm run setup                 # 首次配置：一问一答写 data/config.json
+npm run install-cpa           # 装上游：下载 CPA + workbuddy 插件 + 生成配置（约 30 MB）
+npm run cpa                   # 起上游 CPA
+npm start                     # 起 BuddyKey（等价 node server.mjs）
+npm run setup                 # 只配 BuddyKey 的两个密钥（上游已在别处时用）
 npm run fake-cpa              # 起一个假 CPA（默认 8390），测密钥错误 / 封禁分支用
-npm run check                 # 语法自检（server.mjs + lib/ui.mjs + 两个 tools）
+npm run check                 # 语法自检（server.mjs + lib/ui.mjs + 全部 tools）
 npm run check:docs            # 文档相对链接 + 换行约定（tools/check-docs.ps1）
 ```
+
+`install-cpa` 的三个开关，别记错：
+
+```bash
+npm run install-cpa                        # 交互；探测到已有 CPA 就默认复用
+npm run install-cpa -- --reuse             # 明确复用已有的（不下载）
+npm run install-cpa -- --download          # 明确装本项目专用那套
+npm run install-cpa -- --download --force  # 连已下好的也重下
+```
+
+**装完之后：模型名不要写死。** `data/config.json` 的 `model` 留空 = 启动时问 CPA；
+插件换版本时前缀会从 `wb/` 变 `cn/`（已实测到），写死会得到「装完都对、一调 400
+unknown provider」这种极难查的失败。
 
 **测上游相关分支一律用 `npm run fake-cpa`，别拿真 CPA 试** —— 它有 IP 级失败封禁。
 
@@ -126,6 +144,36 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
   用 setup 产物起服务后 `/healthz` 报 `from: "config"`，建 key + 调模型 **200**。
 
   也就是说：**「别人拉下来能不能用」这条目标已达成**，前提是那人已有可用的 CPA 与已登录账号。
+  → 这条前提已在 2026-11-13 由 `npm run install-cpa` 消掉，见下面那条。
+
+- **上游自带安装器（2026-11-13 已验收）**：
+  从零（隔离副本，无 `runtime/`）跑 `node tools/install-cpa.mjs --download`：
+
+  | 步骤 | 结果 |
+  | --- | --- |
+  | 查 CPA release | `v8.0.69`（2026-11-12） |
+  | 下 CPA zip | 24.8 MB，`sha256 ✓`（与 API 给的 digest 一致） |
+  | 解出 exe | `runtime/cpa/cli-proxy-api.exe`，75 MB |
+  | 查插件商店 | registry 里 `workbuddy` = CodeBuddy Intl CPA `v0.10.0`（zidanefaqih） |
+  | 下插件 zip | 3.2 MB，`sha256 ✓` |
+  | 解出插件 | `runtime/cpa/plugins/workbuddy.dll`，8 MB |
+  | 生成 config | `server.port=8320`、`access.api-keys`、`management.secret-key` 都写好 |
+  | 写 BuddyKey 配置 | `data/config.json` 的 `upstreamKey` / `adminKey` 已填 |
+
+  然后 `npm run cpa` 起它：CPA `8.0.69` 启动、插件注册为
+  `CodeBuddy Intl CPA version=0.10.0`、`API server started successfully on 127.0.0.1:8320`。
+  实测数据面 200、管理面 200、账号列表 `count=8`、登录能拿到 `codebuddy.ai` 授权地址。
+
+  **这一步挖出了本轮的 key 问题**：旧插件暴露 `wb/…`，新插件暴露 `cn/…`，
+  模型名写死会让「装完全对、一调 400」。已改成启动探测（见活跃坑第一条）。
+
+- **生产环境的模型探测也验过（2026-11-13 12:20）**：
+  把生产 `data/config.json` 的 `model` / `acceptModels` 去掉后重启，
+  `/healthz` 报 `modelSource: "probe"`、`model: "wb/deepseek-v4.1-flash"`
+  （本机是旧版插件，探测到 `wb/` 前缀），启动日志还打印了
+  「插件换了前缀：兜底猜的 cn/… 不存在，实际用探测到的」。
+  `/v1/models` 报三个别名，用短名 `deepseek-v4.1-flash` 调用返回 **200**，
+  落号 `0f4f3a929bd81dc3`。生产保持探测模式。
 
 - **连通状态与 key 可用性显示（已验收，2026-11-12 20:46）**：
 
@@ -143,11 +191,34 @@ node tools/setup.mjs --upstream-key sk-cpa-… --admin-key … --port 8318 --yes
 
 ## 待办
 
-见 [docs/PLAN.md](docs/PLAN.md)。A / B / C / D / E 五节全部完成，
+见 [docs/PLAN.md](docs/PLAN.md)。A~E 五节 + F 节（上游自带安装器）全部完成，
 只剩一个可延后的 `dsh-cpa-switch` 搬迁。
 
 ## 活跃坑
 
+- **插件前缀会变，模型名绝不能写死**：同一条 workbuddy 渠道，
+  `workbuddy.dll` v0.9.89（腾讯 CN 版）暴露的是 `wb/deepseek-v4.1-flash`，
+  官方插件商店的 CodeBuddy Intl CPA v0.10.0 暴露的是 `cn/deepseek-v4.1-flash`。
+  写死的结果是「装完什么都对、一调就 400 unknown provider」，而报错指向 model 不指向插件版本，
+  极难查（实测踩过）。现在 `server.mjs` 启动时 `await probeModelCatalog()` 探测，
+  `/healthz` 的 `modelSource` 会报 `probe` / `config` / `fallback`。
+  **探测必须 await**，否则会有「前几个请求按兜底名打、全 400，过一会儿又自己好了」的竞态。
+- **`github.com:443` 的 TLS 可能被阻断，`api.github.com` 却是通的**：
+  所以安装器一律走 `api.github.com` 取 release 元数据与资产
+  （`GET /releases/assets/:id` + `Accept: application/octet-stream`），
+  不要用 `browser_download_url`（那指向 github.com，会卡死）。
+  同类坑见文末的 `git push` 那条。
+- **插件原仓库 `mmqz/cpa-multi-plugins` 已 404**：现在的正源是官方插件商店
+  `router-for-me/CLIProxyAPI-Plugins-Store` 的 `registry.json`，
+  其中 `workbuddy` 条目的 `author` 是 `zidanefaqih`，release 资产名形如
+  `workbuddy_<ver>_<os>_<arch>.zip`。改下载逻辑时按 registry 走，别硬编码仓库名。
+- **自己写 zip 解压时，数据起点要用本地头的 name/extra 长度**：
+  中央目录里的 extra 常与本地头不同（带 unicode path 扩展时），
+  拿中央目录的长度去算会整体偏移，解出来是坏字节而且**不会报错**。
+  见 `tools/zip.mjs` 的 `readZipEntry`。
+- **`fetch` 连接被拒时，`ECONNREFUSED` 在 `error.cause.code` 里**，不在 `message`（message 只是
+  `fetch failed`）。按 message 判断会把「端口没人听」误判成「被占用」，
+  于是明明能起却拒绝启动（`install-cpa` 与 `run-cpa` 都踩过）。
 - **cloudflared 的 metrics 端口是全局的**：默认 `127.0.0.1:20241`，机器上任何一条隧道都能占着它。
   只探「端口有响应」会把**别人的隧道**认成日志里那条还活着，
   然后在页面上显示一个早已失效的公网地址（实测踩过：起一条测试隧道，生产页面立刻误报「运行中」）。

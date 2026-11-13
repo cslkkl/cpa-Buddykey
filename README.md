@@ -25,90 +25,75 @@ BuddyKey 在中间加一层薄网关：
 
 ## 它不做什么
 
-这一层**不提供额度，也不替你登录 WorkBuddy**。它前面必须有
-[CPA（CLIProxyAPI）](https://github.com/router-for-me/CLIProxyAPI) 在跑，
-且 CPA 里已经装好 workbuddy 渠道插件、登好至少一个 WorkBuddy 账号。
+这一层**不提供额度，也不替你登录 WorkBuddy** —— 授权必须你本人扫码。
+
+上游那一层（[CPA（CLIProxyAPI）](https://github.com/router-for-me/CLIProxyAPI) 本体 +
+workbuddy 渠道插件 + 配置）由 `npm run install-cpa` 自动装进项目里，
+所以不用你自己去找、去配。
 
 ```
 你的客户端 ──sk-pool-…──▶ BuddyKey ──▶ CPA ──▶ WorkBuddy 上游
                               ↑           ↑
                         具名 key/限额   账号池/额度
+                          （本层）    （安装器负责）
 ```
 
-所以「拉下来就能用」的准确含义是：**CPA 那边已经就绪的人**，拉下来配两个密钥、十分钟内就能发出第一个请求。
+所以「拉下来就能用」的准确含义是：**拉下来 → 跑安装器 → 扫码登录一次**，
+之后就有自己的 key 与额度池了。
 
 ## 从零到第一个请求
 
-### 0. 前提
-
-| 需要 | 怎么确认 |
-| --- | --- |
-| Node ≥ 20 | `node -v` |
-| CPA 在 `127.0.0.1:8317` 上跑着 | `curl http://127.0.0.1:8317/v1/models` 有响应 |
-| CPA 里装好 workbuddy 插件 | CPA 配置里 `plugins.configs.workbuddy.enabled: true` |
-| 至少登录过一个 WorkBuddy 账号 | CPA 的 `~/.cli-proxy-api/workbuddy-*.json` 存在 |
-
-> workbuddy 渠道插件目前只有 Windows 版（`workbuddy.dll`），Linux/macOS 上跑不了这个渠道。
-
-### 1. 拿到两个密钥
-
-打开 CPA 的 `config.yaml`（常见位置：`~/.dsh/cpa-panel/runtime/cpa/config.yaml`
-或 `~/.cli-proxy-api/config.yaml`）：
-
-```yaml
-access:
-    api-keys:
-        - "sk-cpa-local-2026"        # ← 第 1 个：上游 API key，明文，脚本能自动读到
-
-management:
-    secret-key: "$2a$10$...."        # ← 第 2 个：管理密钥，注意这是 bcrypt 哈希
-```
-
-- **上游 API key**：`access.api-keys` 的第一条，**明文**，`npm run setup` 会自动替你填。
-- **管理密钥**：`management.secret-key` 要填的是它的**明文原值**。
-  配置文件里存的可能是 bcrypt（`$2a$…`）哈希 —— 哈希还原不出明文，
-  要用你当初设置的那个值；忘了就去 CPA 面板重置一个。
-  明文输错的代价很直接：见下面的「IP 封禁」。
-
-### 2. 配好并启动
+**只需要两步，加上一次扫码。** 项目自带安装器，会把上游那一层（CPA 本体 + workbuddy
+渠道插件 + 配置）一并装进 `runtime/`，不用你自己去找、去配。
 
 ```bash
-npm run setup          # 一问一答；上游 key 自动嗅探，管理密钥粘进去
-npm start              # 或双击 start.cmd
+npm run install-cpa      # 下载 CPA + 插件，生成配置（约 30 MB，一次性）
+npm run cpa              # 起上游（新窗口，别关）
+npm start                # 起 BuddyKey（另一个窗口）
 ```
 
-`npm run setup` 会写 `data/config.json` 并立刻校验一次管理密钥。看到这行就算配对了：
+然后打开 <http://127.0.0.1:8318/>，点「登录 WorkBuddy 账号」扫码 ——
+**这是唯一需要你本人做的步骤**，因为授权只能人来做。登录完这个号就进池子，
+接着创建 API key 就能用了。
 
-```
-✓ 管理密钥有效，CPA 里读到 8 个凭据文件。
-```
+### 这台机器上已经有 CPA 怎么办
 
-不想用交互脚本，就手写 `data/config.json`（从 `config.sample.json` 复制）填这两个字段：
-
-```json
-{ "upstreamKey": "sk-cpa-local-2026", "adminKey": "<management.secret-key 的明文>" }
-```
-
-或者用环境变量（适合容器 / CI）：
+安装器会先探测，找到就**默认复用、不覆盖**：
 
 ```bash
-BUDDYKEY_UPSTREAM_KEY=sk-… BUDDYKEY_ADMIN_KEY=… npm start
+npm run install-cpa -- --reuse     # 接上已有的那份
+npm run install-cpa -- --download  # 强制装一份本项目专用的
 ```
 
-三个来源优先级：`config.json` > 环境变量 > `~/.dsh/.credentials.yaml`。
+已有 CPA 可能在 `~/.dsh/cpa-panel/runtime/cpa` 或 `~/.cli-proxy-api`。
+它会读出那份 `config.yaml` 里的 `access.api-keys` 与 `management.secret-key` 来填
+BuddyKey 的配置；如果那个 secret 是 bcrypt 哈希（`$2a$…`）而读不出明文，
+会提示你手填原值。
 
-### 3. 登录账号、创建 key
+### 安装器具体做了什么
 
-打开 <http://127.0.0.1:8318/> ：
+| 步骤 | 内容 | 来源 |
+| --- | --- | --- |
+| 1 | 下载 CPA 本体并解出 `cli-proxy-api.exe` | `router-for-me/CLIProxyAPI` 最新 release |
+| 2 | 下载 workbuddy 渠道插件 | 官方插件商店 `CLIProxyAPI-Plugins-Store` registry 指向的 release |
+| 3 | 生成最小 `config.yaml`（只开 workbuddy 一个渠道） | 本地生成 |
+| 4 | 把两个密钥写进 `data/config.json` | 本地生成 |
 
-1. 切到「账号」视图 → 点「登录 WorkBuddy 账号」→ 扫码授权，这个号就进池子了；
-2. 回「API Keys」视图 → 点「创建 API key」→ 填名字、限额、账号范围；
-3. **明文只显示这一次**，点「复制」保存好（丢了只能删了重建）。
+两点值得说明：
 
-如果池子或密钥还没就绪，页面顶部会有一张「还差一步就能用」的卡片，
-逐条告诉你缺什么、去哪填、当前密钥是从哪个来源读到的 —— 不用回来翻这份文档。
+- **每次下载都校验 sha256**，对不上就不落盘 —— 这两个包都是第三方二进制。
+- 全部落在 `runtime/`（已 gitignore）。删掉这个目录 = 卸掉上游，不影响 BuddyKey 自身。
 
-### 5. 出问题时先看「连通状态」
+### 模型名不用你操心
+
+插件不同版本的前缀不一样（`wb/deepseek-v4.1-flash` / `cn/deepseek-v4.1-flash`…），
+所以 BuddyKey 默认**启动时问一次 CPA**，用真实存在的那个，并同时接受短别名
+（`deepseek-v4.1-flash`、`deepseek-v4.1`）。`/healthz` 的 `modelSource`
+会告诉你这个模型名是探到的（`probe`）还是配置里写死的（`config`）。
+
+要固定成某个值，就在 `data/config.json` 里写 `"model": "..."`。
+
+### 出问题时先看「连通状态」
 
 页面第二块是三条独立探针，红绿一眼可见：
 
@@ -121,7 +106,7 @@ BUDDYKEY_UPSTREAM_KEY=sk-… BUDDYKEY_ADMIN_KEY=… npm start
 每把 key 那行还会显示「上次调用成功/失败 + 状态码 + 耗时 + 落在哪个号」，
 以及当前是否已被日额度拦住（额度满了会直接说，不会假装正常）。
 
-### 4. 发出第一个请求
+### 发出第一个请求
 
 ```bash
 curl http://127.0.0.1:8318/v1/chat/completions \
@@ -170,7 +155,9 @@ CPA 没起，或者 `upstream` 地址不对。先 `curl http://127.0.0.1:8317/v1
 
 - key 明文、调用账本、配置：`data/`（本机，不入库、不出网）。
   ⚠️ `data/config.json` 里有 CPA 的两个密钥明文 —— 别提交、别外发。
+- 上游本体与插件：`runtime/`（安装器下载的，不入库，删掉即卸载上游）。
 - 账号登录态：由 CPA 保存在 `~/.cli-proxy-api/`，BuddyKey 不复制。
+  注意这是**固定路径**，装在 `runtime/` 的那份 CPA 也读它 —— 所以同机多份 CPA 共用账号。
 - 管理密钥：默认从 `data/config.json` / 环境变量读；
   这台机器上装了 dsh-cpa-switch 的话，也可以继续从 `~/.dsh/.credentials.yaml` 的 `refs` 段取。
 
@@ -183,6 +170,9 @@ CPA 没起，或者 `upstream` 地址不对。先 `curl http://127.0.0.1:8317/v1
   细节见 [架构说明](docs/ARCHITECTURE.md)。
 - 隧道是临时的：重启即换域名；公网暴露只靠 `sk-pool-` 这把 key 拦人。
 - 电脑关机即断：整条链路两环在本机，账号登录态也在本机磁盘。
+- **插件的前缀会随版本变**（`wb/` ↔ `cn/`），所以模型名默认启动时探测。
+  若 CPA 那时还没起，会先按兜底名跑并在 `/healthz` 标 `modelSource: "fallback"`；
+  上游起来后重启一次即可。
 
 ## 文档
 
@@ -204,7 +194,7 @@ npm run fake-cpa            # 假 CPA，起在 127.0.0.1:8390
 把 `upstream` 指到它就切断了与真实账号池的关系。
 
 ```bash
-npm run check               # 四个 .mjs 的语法自检
+npm run check               # 全部 .mjs 的语法自检
 npm run check:docs          # 文档相对链接 + 换行约定
 ```
 
