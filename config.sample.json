@@ -14,11 +14,12 @@
   "adminKeyRef": "CPA_ADMIN_KEY",
 
   "channel": "workbuddy",
-  "model": "wb/deepseek-v4.1-flash",
-  "acceptModels": [
+  "model": "",
+  "acceptModels": [],
+  "modelFallback": [
+    "cn/deepseek-v4.1-flash",
     "wb/deepseek-v4.1-flash",
-    "wb/deepseek-v4.1",
-    "deepseek-v4.1-flash",
-    "deepseek-v4.1"
+    "cn/deepseek-v4-flash",
+    "wb/deepseek-v4-flash"
   ]
 }

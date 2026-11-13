@@ -50,9 +50,26 @@ const DEFAULTS = {
   adminKeyRef: 'CPA_ADMIN_KEY',
   /** 这一层锁死的渠道与模型。 */
   channel: 'workbuddy',
-  model: 'wb/deepseek-v4.1-flash',
-  /** 用户可能随手写的别名，全部归一到上面那个模型。 */
-  acceptModels: ['wb/deepseek-v4.1-flash', 'wb/deepseek-v4.1', 'deepseek-v4.1-flash', 'deepseek-v4.1'],
+  /**
+   * 上游模型 id。
+   *
+   * ⚠️ 留空 = **启动时从 CPA 现探**（推荐）。别写死。
+   *   同一份插件不同版本的前缀会变：v0.9.x 是 `wb/deepseek-v4.1-flash`，
+   *   v0.10.0 变成 `cn/deepseek-v4.1-flash`（国际版还会是别的）。
+   *   写死会导致「装完什么都对、一调就 400 unknown provider」——
+   *   报错信息还指向 model 而不是插件版本，极难查（踩过）。
+   *   填了值就当用户明确指定，不再探测。
+   */
+  model: '',
+  /** 对外暴露的模型别名。`__AUTO__` = 由探测结果生成，见 `resolveModels`。 */
+  acceptModels: [],
+  /** 探测失败时的兜底，按优先级排。 */
+  modelFallback: [
+    'cn/deepseek-v4.1-flash',
+    'wb/deepseek-v4.1-flash',
+    'cn/deepseek-v4-flash',
+    'wb/deepseek-v4-flash',
+  ],
   maxBodyBytes: 32 * 1024 * 1024,
 }
 
@@ -239,6 +256,112 @@ function maskOf(key) {
   return `sk-pool-${body.slice(0, 6)}****${body.slice(-4)}`
 }
 
+/* ─────────────────────────── 模型解析 ─────────────────────────── */
+
+/**
+ * 这一层对外只暴露一个模型，但它的**上游 id**必须跟插件的版本走。
+ *
+ * 见过的两代前缀：
+ *   - workbuddy.dll v0.9.x（腾讯 CN 版）→ `wb/deepseek-v4.1-flash`
+ *   - CodeBuddy Intl CPA v0.10.0      → `cn/deepseek-v4.1-flash`（国际版还有别的区）
+ * 插件升级换前缀是常事，所以默认在启动时问一次 CPA `/v1/models`，
+ * 按「候选优先级」挑一个真实存在的；探测不到才落回 `modelFallback`。
+ *
+ * 对外的别名集合也跟着探测结果生成 —— 客户端填 `deepseek-v4.1-flash`、
+ * `deepseek-v4.1`、或者上游全名都能用，全部归一到同一个上游 id。
+ */
+const MODEL_STATE = {
+  /** 最终用的上游模型 id。 */
+  upstream: '',
+  /** 客户端可以填的别名（含 `upstream` 本身）。 */
+  accept: [],
+  /** `probe` = 从 CPA 探到的；`config` = 用户写死的；`fallback` = 都没成才用的兜底。 */
+  source: 'fallback',
+  /** 探测时看到的候选，排好序；`/healthz` 会带上，排查版本问题用。 */
+  candidates: [],
+}
+
+function shortAliasesOf(upstreamModel) {
+  /** `cn/deepseek-v4.1-flash` → `deepseek-v4.1-flash`、`deepseek-v4.1` */
+  const bare = upstreamModel.includes('/') ? upstreamModel.split('/').slice(1).join('/') : upstreamModel
+  const out = [upstreamModel, bare]
+  /** 去掉 `-flash` 也留一个：客户端文档里常写短名。 */
+  if (bare.endsWith('-flash')) out.push(bare.slice(0, -'-flash'.length))
+  return [...new Set(out.filter((item) => item !== ''))]
+}
+
+/** 从候选里挑第一个真实存在的；都不在就取第一个（上游会自己报错，比静默降级好）。 */
+function resolveModels(availableIds) {
+  if (CONFIG.model !== '') {
+    MODEL_STATE.upstream = CONFIG.model
+    MODEL_STATE.accept = CONFIG.acceptModels.length > 0 ? [...CONFIG.acceptModels] : shortAliasesOf(CONFIG.model)
+    if (!MODEL_STATE.accept.includes(CONFIG.model)) MODEL_STATE.accept.unshift(CONFIG.model)
+    MODEL_STATE.source = 'config'
+    return
+  }
+
+  const ids = Array.isArray(availableIds) ? availableIds : []
+  MODEL_STATE.candidates = ids.filter((id) => typeof id === 'string' && id !== '')
+
+  const wanted = CONFIG.modelFallback.filter((id) => typeof id === 'string' && id !== '')
+  const hit = wanted.find((candidate) => ids.includes(candidate))
+  if (hit !== undefined) {
+    MODEL_STATE.upstream = hit
+    MODEL_STATE.accept = shortAliasesOf(hit)
+    MODEL_STATE.source = 'probe'
+    return
+  }
+
+  /**
+   * 兜底优先级没命中：看看有没有「deepseek-v4.1-flash」结尾的，
+   * 有就说明插件换了前缀，用真实存在的那个比硬用兜底更可能直接可用。
+   */
+  const byShape = ids.find((id) => /deepseek-v4\.1-flash$/.test(id)) ?? ids.find((id) => /deepseek-v4.*flash$/.test(id))
+  if (byShape !== undefined) {
+    MODEL_STATE.upstream = byShape
+    MODEL_STATE.accept = shortAliasesOf(byShape)
+    MODEL_STATE.source = 'probe'
+    return
+  }
+
+  /** 一个都没探到（CPA 没起 / 没登录）：先按兜底走，等 `/admin/api/health` 再探。 */
+  const fallback = wanted[0] ?? 'cn/deepseek-v4.1-flash'
+  MODEL_STATE.upstream = fallback
+  MODEL_STATE.accept = shortAliasesOf(fallback)
+  MODEL_STATE.source = 'fallback'
+}
+
+/**
+ * 启动时问一次 CPA 有哪些模型。
+ *
+ * 失败不抛 —— 这一步是为了「少一次配置」而不是前提条件；
+ * CPA 没起的时候服务照样要能起来，页面会告诉你上游不通。
+ */
+async function probeModelCatalog() {
+  if (UPSTREAM_KEY === '') {
+    resolveModels([])
+    return
+  }
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 5000)
+    const response = await fetch(`${CONFIG.upstream}/v1/models`, {
+      headers: { authorization: `Bearer ${UPSTREAM_KEY}` },
+      signal: controller.signal,
+    })
+    clearTimeout(timer)
+    if (response.ok !== true) {
+      resolveModels([])
+      return
+    }
+    const body = await response.json().catch(() => null)
+    const ids = Array.isArray(body?.data) ? body.data.map((item) => item?.id).filter((id) => typeof id === 'string') : []
+    resolveModels(ids)
+  } catch {
+    resolveModels([])
+  }
+}
+
 function keyByToken(token) {
   if (token === '') return undefined
   return store.keys.find((item) => item.key === token)
@@ -421,7 +544,7 @@ async function readPool() {
       value: {
         ok: true,
         channel: CONFIG.channel,
-        model: CONFIG.model,
+        model: MODEL_STATE.upstream,
         accountCount: accountsBody?.accounts?.length ?? rows.length,
         remain,
         used,
@@ -917,11 +1040,11 @@ async function proxy(request, response, url) {
     return openaiError(response, 403, `API key「${recordOfKey.name}」已被停用。`, 'key_disabled')
   }
 
-  // 模型目录：只报这两个 id（都归一到同一个上游模型），客户端就不会去试别的。
+  // 模型目录：报当前真实可用的那些别名，客户端就不会去试别的。
   if (url.pathname === '/v1/models' && request.method === 'GET') {
     return jsonRes(response, {
       object: 'list',
-      data: ['deepseek-v4.1', 'deepseek-v4.1-flash'].map((id) => ({
+      data: MODEL_STATE.accept.map((id) => ({
         id,
         object: 'model',
         created: Math.floor(Date.parse(recordOfKey.createdAt) / 1000),
@@ -946,19 +1069,19 @@ async function proxy(request, response, url) {
   if (asked === '') {
     return openaiError(response, 400, '缺少 model 参数。', 'missing_model', 'model')
   }
-  if (!CONFIG.acceptModels.includes(asked)) {
+  if (!MODEL_STATE.accept.includes(asked)) {
     // 这一层只放行 workbuddy 的 deepseek-v4.1，别的模型明确拒绝 —— 不静默改写。
     return openaiError(
       response,
       404,
-      `本 key 只提供 ${CONFIG.model}（workbuddy 渠道）。${asked} 不在可用列表里。`,
+      `本 key 只提供 ${MODEL_STATE.upstream}（${CONFIG.channel} 渠道）。${asked} 不在可用列表里。`,
       'model_not_found',
       'model',
     )
   }
 
   // 一律改写成上游认的那个 id：`deepseek-v4.1` 这类短名也走同一条路。
-  const upstreamBody = JSON.stringify({ ...payload, model: CONFIG.model })
+  const upstreamBody = JSON.stringify({ ...payload, model: MODEL_STATE.upstream })
   const startedAt = Date.now()
   const streaming = payload?.stream === true
 
@@ -1038,7 +1161,7 @@ async function proxy(request, response, url) {
         ts: new Date().toISOString(),
         keyId: recordOfKey.id,
         keyName: recordOfKey.name,
-        model: CONFIG.model,
+        model: MODEL_STATE.upstream,
         status: 599,
         stream: streaming,
         error: String(error?.message ?? error),
@@ -1076,7 +1199,7 @@ async function proxy(request, response, url) {
         ts: recordOfKey.lastUsedAt,
         keyId: recordOfKey.id,
         keyName: recordOfKey.name,
-        model: CONFIG.model,
+        model: MODEL_STATE.upstream,
         status: upstreamResponse.status,
         stream: streaming,
         promptTokens: Number(usage.prompt_tokens ?? 0),
@@ -1270,7 +1393,8 @@ async function adminApi(request, response, url) {
     const nicknameOf = (authIndex) => nicknames.get(authIndex) ?? authIndex
     return jsonRes(response, {
       ok: true,
-      models: ['deepseek-v4.1', 'deepseek-v4.1-flash'],
+      models: MODEL_STATE.accept.length > 0 ? MODEL_STATE.accept : [MODEL_STATE.upstream],
+      modelSource: MODEL_STATE.source,
       channel: CONFIG.channel,
       /**
        * 首次上手要用：页面在「一个号都没有」时据此给出具体缺什么、去哪配，
@@ -1285,7 +1409,8 @@ async function adminApi(request, response, url) {
         configFile: CONFIG_FILE,
         envNames: [CONFIG.upstreamKeyEnv, CONFIG.adminKeyEnv],
         refsFile: path.join(os.homedir(), '.dsh', '.credentials.yaml'),
-        boundModel: CONFIG.model,
+        boundModel: MODEL_STATE.upstream,
+        boundModelSource: MODEL_STATE.source,
       },
       pool,
       keys: store.keys.map((item) => {
@@ -1494,7 +1619,9 @@ const server = http.createServer((request, response) => {
        */
       return jsonRes(response, {
         ok: true,
-        model: CONFIG.model,
+        model: MODEL_STATE.upstream,
+        modelSource: MODEL_STATE.source,
+        models: MODEL_STATE.accept,
         channel: CONFIG.channel,
         upstream: CONFIG.upstream,
         upstreamKey: UPSTREAM_KEY === '' ? 'missing' : 'ok',
@@ -1521,10 +1648,26 @@ seedDayUsage()
 
 const SOURCE_LABEL = { config: 'config.json', env: '环境变量', refs: '.credentials.yaml', none: '未配置' }
 
+/**
+ * 先探一次模型目录再开始监听。
+ *
+ * ⚠️ 必须 await：`/v1/models` 与 `acceptModels` 校验都依赖探测结果。
+ *   不 await 就会出现「服务已起、前几个请求按兜底模型名打、全 400」的竞态，
+ *   而且过一会儿又自己好了 —— 最难查的那种。
+ */
+await probeModelCatalog()
+
 server.listen(CONFIG.port, CONFIG.host, () => {
   console.log(`BuddyKey listening on http://${CONFIG.host}:${CONFIG.port}`)
   console.log(`  管理页   http://${CONFIG.host}:${CONFIG.port}/`)
-  console.log(`  允许模型 ${CONFIG.model}（渠道 ${CONFIG.channel}）`)
+  console.log(`  允许模型 ${MODEL_STATE.upstream}（渠道 ${CONFIG.channel}，来源 ${MODEL_STATE.source}）`)
+  if (MODEL_STATE.source === 'fallback' && MODEL_STATE.candidates.length === 0) {
+    console.log('           ⚠️ 没能从 CPA 探测到模型目录（上游没起？）。现在用的是兜底名，')
+    console.log('              上游一旦起来、名字对不上就会 400 unknown provider —— 到时重启一次即可。')
+  }
+  if (MODEL_STATE.source === 'probe' && CONFIG.modelFallback[0] !== MODEL_STATE.upstream) {
+    console.log(`           （插件换了前缀：兜底猜的 ${CONFIG.modelFallback[0]} 不存在，实际用探测到的。）`)
+  }
   console.log(
     `  上游     ${CONFIG.upstream}   key=${UPSTREAM_KEY === '' ? '缺失' : '已取到'}（来源 ${SOURCE_LABEL[UPSTREAM.source]}）`,
   )
